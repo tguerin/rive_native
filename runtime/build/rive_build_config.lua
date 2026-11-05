@@ -145,6 +145,15 @@ if _OPTIONS['with_optick'] then
     RIVE_OPTICK_VERSION = '1.4.0.0'
 end
 
+newoption({
+    trigger = 'with_rive_path_query',
+    description = 'Deferred render paths retain a queryable RawPath twin on '
+        .. 'request, for hosts that hit test and measure recorded paths.',
+})
+if _OPTIONS['with_rive_path_query'] then
+    defines({ 'WITH_RIVE_PATH_QUERY' })
+end
+
 newoption({ trigger = 'with_microprofile', description = 'use microprofile profiler' })
 if _OPTIONS['with_microprofile'] then
     defines({ 'RIVE_MICROPROFILE' })
@@ -231,6 +240,18 @@ do
     else
         -- Deprecated way of turning on LTO, for older versions of premake.
         flags({ 'LinkTimeOptimization' })
+    end
+end
+
+if _OPTIONS['arch'] == 'universal' then
+    -- ar updates an archive in place, which it refuses once the archive is
+    -- fat, so an incremental universal build writes each one afresh.
+    local base_gettoolname = premake.tools.clang.gettoolname
+    function premake.tools.clang.gettoolname(cfg, tool)
+        if tool == 'ar' then
+            return 'rm -f $out && ar'
+        end
+        return base_gettoolname(cfg, tool)
     end
 end
 
@@ -529,10 +550,6 @@ if _OPTIONS['for_android'] then
     -- Detect the NDK.
     local EXPECTED_NDK_VERSION = 'r27c'
     local NDK_LONG_VERSION_STRING = "27.2.12479018"
-    if _OPTIONS['for_unreal'] then
-        EXPECTED_NDK_VERSION = '25.1.8937393'
-        NDK_LONG_VERSION_STRING = '25.1.8937393'
-    end
     ndk = os.getenv('NDK_PATH') or os.getenv('ANDROID_NDK') or '<undefined>'
     local ndk_version = '<undetected>'
     local ndk_long_version = '<undetected>'
@@ -781,6 +798,16 @@ if os.host() == 'macosx' then
         buildoptions({
             '-mmacosx-version-min=11.0',
         })
+        -- Pass the deployment target at LINK time too. Without this, the linker
+        -- stamps LC_BUILD_VERSION.minos from the build host's SDK, so a dylib
+        -- built against a newer SDK can advertise a higher min OS version and
+        -- fail to load on older macOS versions.
+        --
+        -- Note: buildoptions affects compilation only (e.g., availability macros)
+        -- and does not influence the link step that stamps the final dylib.
+        linkoptions({
+            '-mmacosx-version-min=11.0',
+        })
     end
 
     filter({ 'system:macosx', 'options:arch=host', 'action:xcode4' })
@@ -906,7 +933,8 @@ if _OPTIONS['arch'] == 'wasm' or _OPTIONS['arch'] == 'js' then
 
     filter({ 'options:arch=wasm', 'options:no-wasm-simd' })
     do
-        linkoptions({ '-s MIN_SAFARI_VERSION=120000' })
+        -- 120200 (Safari 12.2) is the oldest emsdk >=4.0 supports; was 120000.
+        linkoptions({ '-s MIN_SAFARI_VERSION=120200' })
     end
 
     filter('options:arch=js')

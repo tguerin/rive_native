@@ -9,14 +9,18 @@ using namespace rive;
 
 void KeyFrame::computeSeconds(int fps) { m_seconds = frame() / (float)fps; }
 
+// `KeyFrame::frameChanged` lives in
+// `editor_native/native/src/editor/animation/keyframe_editor.cpp`
+// — see the matching comment in `keyed_property.cpp`.
+
 StatusCode KeyFrame::import(ImportStack& importStack)
 {
-    auto importer =
-        importStack.latest<KeyedPropertyImporter>(KeyedProperty::typeKey);
-    if (importer == nullptr)
-    {
-        return StatusCode::MissingObject;
-    }
-    importer->addKeyFrame(std::unique_ptr<KeyFrame>(this));
-    return Super::import(importStack);
+  auto importer = importStack.latest<KeyedPropertyImporter>(
+      KeyedProperty::typeKey);
+  if (importer == nullptr)
+  {
+    return StatusCode::MissingObject;
+  }
+  importer->addKeyFrame(std::unique_ptr<KeyFrame>(this));
+  return Super::import(importStack);
 }

@@ -1,3 +1,91 @@
+## 0.2.0-dev.4
+
+- Updates the Rive C++ runtime and renderer for the latest features, bug fixes, and performance improvements.
+
+### Changes
+
+- Rive widgets redraw only when the artboard changed. Pass `drawOptimization: DrawOptimization.alwaysDraw` to `RiveArtboardWidget`, `RiveFileWidget` or `RiveProceduralRenderingWidget` to redraw every advanced frame. A custom painter that draws more than its artboard calls `notifyListeners()` when that content changes, or uses `alwaysDraw`.
+- Breaking: `RenderTexturePainter` separates advancing from drawing. Implement `bool advance(double elapsedSeconds)`, which returns whether to keep advancing, and `void paint(RenderTexture texture, double devicePixelRatio, Size size)`, which only draws. Override `needsPaint` to let the render object skip frames that changed nothing.
+- Adds `Artboard.didChange`, true when the artboard changed since it was last drawn.
+- A focused text input now blurs when a primary press lands outside it, as a platform text field does.
+- Adds `PointerButton` and a `button` argument to `StateMachine.pointerDown`, `pointerUp`, `dragStart` and `dragEnd`, so listeners can match secondary and middle mouse buttons. `button` defaults to `PointerButton.primary`. `StateMachine.listensToButtonAt` reports whether a listener under a position responds to a button.
+
+### Performance
+
+- Android: opt in with `RiveNative.init(androidHardwareBuffers: true)` and, on API 29 and up, Rive draws straight into hardware buffers that Flutter samples as-is, with no surface swap or blit per frame. On a Pixel 8a showing 8 to 16 widgets this frees about one CPU core and 20 to 40 MB of graphics memory; a widget whose scale animates, which recreates its texture every frame, drops fewer frames. Off by default; devices that cannot take the path, and everything below API 29, keep the surface path.
+
+### Fixes
+
+- A view model trigger fired by a nested state machine now reaches sibling state machines bound to the same view model. It used to be cleared before they checked their transitions.
+- Windows: the app no longer hangs or crashes on exit while releasing the GPU device.
+- `RenderPath.addPath` with a disposed path no longer crashes. It adds nothing.
+- Android, OpenGL: Rive content that a script draws into a GPU canvas now renders. It came out empty, so a blur of it drew nothing, or a black band on Mali GPUs.
+- Android: the Rive Renderer releases the memory it allocated for drawing once the last Rive widget is gone.
+- Disposing a Rive widget no longer leaves its render target registered in the renderer. Over many widget lifetimes that let frames run further ahead of rendering.
+- Web: with Chrome's draft WebGL extensions enabled, content no longer stops rendering after the first frame with `GL_INVALID_OPERATION: glBlitFramebuffer: Blit feedback loop`. See [#635](https://github.com/rive-app/rive-flutter/issues/635).
+- `ArtboardWidgetRiveRenderer` disposes the internal `ArtboardWidgetPainter` wrapping `painter` when `painter` changes. Each change used to leave one wrapper undisposed, which `leak_tracker` reported as `notDisposed`. The `painter` you pass in is never disposed by the widget. See [#636](https://github.com/rive-app/rive-flutter/issues/636).
+- `Factory.flutter`: `File.decode()` no longer waits for images from unrelated `Factory.decodeImage()` calls. If one of those never completed, for example an image decode started in a widget test that has since ended, every later file decode hung. See [#658](https://github.com/rive-app/rive-flutter/issues/658).
+- iOS/macOS: Swift Package Manager no longer rejects the `rive_native` manifest with `value of type 'String' has no member 'replacingOccurrences'`, which stopped package resolution for the whole app. See [#634](https://github.com/rive-app/rive-flutter/issues/634).
+
+## 0.2.0-dev.3
+
+- Updates the Rive C++ runtime and renderer for the latest features, bug fixes, and performance improvements.
+- Adds `RiveFocusWidget`: wrap a Rive widget with it and the graphic joins Flutter's keyboard focus. Tab and Shift+Tab traverse the content's focus tree and leave it at either end, arrow keys move focus by position, keys and typed characters reach the focused node (a `TextInput` can be edited), and Rive focus clears when Flutter focus leaves the widget. Content without focus nodes is never a tab stop. `StateMachinePainter` provides the state machine through the new `RiveKeyboardFocusMixin`.
+- Adds `StateMachine.hasFocusNodes` and `StateMachine.focusState` (`FocusState`: `hasFocus`, `expectsKeyboardInput`).
+- Adds `File.artboardNames`, the artboard names in file order.
+
+### Fixes
+
+- Android: multiple `RiveWidget`s no longer throttle each other or stay blank under load, and heavy Rive content no longer drags down the app's frame rate.
+- Animations keep their speed when frames are skipped under load, and no longer jump ahead when rendering pauses briefly, such as the iOS app switcher.
+- Windows: the Rive Renderer runs on GPUs limited to Direct3D feature level 11_0. Apps on that hardware used to crash on the first file load.
+- Windows: when the Rive Renderer cannot start (no GPU adapter or D3D11 device), decoding a file with `Factory.rive` returns null instead of crashing. Fall back to `Factory.flutter`.
+- Fixes a possible crash when a render texture and its deferred recording session are disposed in either order.
+
+## 0.2.0-dev.2
+
+- Updates the Rive C++ runtime and renderer for the latest features, bug fixes, and performance improvements.
+
+### Data binding
+
+- Adds global view model support: `File.globalViewModelNames`, plus `StateMachine.setViewModelInstance` / `setGlobalViewModelInstance` to stage instances, `bind()` to apply them in a single rebind (unset slots get default instances), and `globalViewModelInstance(name)` to read them back. Property listeners on global instances fire on advance. Instances you create are `BindableViewModelInstance` - the only type the staging calls accept. Instances read back from bound slots are plain `ViewModelInstance` views: read, write, and listen to them, but binding one again is a compile error (and a cast throws at runtime) - create your own instance to share state.
+
+### Fixes
+
+- iOS: audio resumes when the app returns from the background. See [#563](https://github.com/rive-app/rive-flutter/issues/563).
+- Web: the deferred render worker works again on the Emscripten 4 build, which stopped exporting heap views on `Module`.
+- Web: a widget that reuses a pooled canvas no longer shows the previous widget's last frame, stretched to its own layout, until its first frame lands.
+- Semantics: screen reader actions (tap, increase, decrease, focus) now work after the animation settles and stops producing frames, matching pointer input behavior.
+- Semantics: swapping the artboard on a painter resets the semantic tree, so nodes from the previous artboard no longer collide with the new one.
+- Semantics: a node reparented out of a removed parent is no longer dropped from the accessibility tree.
+- Semantics: malformed UTF-8 in a label, value, or hint no longer aborts the whole semantics update.
+- Semantics: the semantic tree survives widget unmount/remount with a kept painter (e.g. navigating away from a route and back), instead of coming back permanently empty.
+- Semantics: children of a zero-area node are promoted into its parent instead of being dropped with it, matching the Android runtime's behavior.
+- Semantics: moving screen reader focus away from a Rive element now clears its focused state.
+- Semantics: turning the screen reader off and back on no longer crashes with a framework assert.
+
+## 0.2.0-dev.1
+
+- GPU Canvas support at runtime, enabled through deferred rendering.
+
+### Deferred rendering
+
+The Rive Renderer (`Factory.rive`) now uses deferred rendering on native platforms, and it is the only native mode. Each frame is recorded on the UI thread as a compact command stream and replayed on a dedicated render thread, so GPU work no longer blocks the UI thread. Resources made with `Factory.rive` (paths, paints, images, text) are lightweight recording proxies that resolve during replay. Rendering behavior and output are unchanged for typical `RiveWidget` / file-based usage; the changes below
+matter when migrating advanced integrations.
+
+Migrating:
+
+- All Rive calls stay on the calling (UI) thread. The command stream has a single writer per frame, so advancing or drawing from other threads is not supported.
+- **Breaking**: removes `Rive.batchAdvance` and `Rive.batchAdvanceAndRender` (and the native batch worker). Their worker threads recorded into the command stream concurrently and corrupted it. Advance and draw each state machine on the calling thread instead.
+- `RenderTexturePainter.riveFactory` names the factory the painted content was made with, so the texture attaches its recording session (a sessionless texture draws nothing on native). Defaults to `Factory.rive` override with the decoded file's `File.riveFactory` when content records elsewhere (on web this opts single-file content into the per-file session worker path), or with null when the session is managed manually.
+- One artboard instance per texture: showing the same artboard instance in two widgets leaves the later one blank, with a debug message. Create an artboard instance per widget.
+- `Factory.rive` on native resolves to the render context's recording session. `file.riveFactory == Factory.rive` still holds, and resources created directly on `Factory.rive` record and render correctly.
+- Advanced session control (manual attach/detach via `RenderTexture.useDeferredSession`, pacing, thread stats) is available through `package:rive_native/rive_deferred.dart`.
+
+### Fixes
+
+- Corrected the minimum Flutter version to 3.32.0 (Dart 3.8.0). It was declared as 3.28.0, so older Flutter versions resolved this package and then failed to compile in the semantics overlay, which has required 3.32.0 since 0.1.6. See [#643](https://github.com/rive-app/rive-flutter/issues/643).
+
 ## 0.1.11
 
 - Updates the Rive C++ runtime and renderer for the latest features, bug fixes, and performance improvements.

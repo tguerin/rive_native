@@ -6,17 +6,20 @@ using namespace rive;
 
 StatusCode TextModifier::onAddedDirty(CoreContext* context)
 {
-    StatusCode code = Super::onAddedDirty(context);
-    if (code != StatusCode::Ok)
-    {
-        return code;
-    }
+  StatusCode code = Super::onAddedDirty(context);
+  if (code != StatusCode::Ok)
+  {
+    return code;
+  }
 
-    if (parent() != nullptr && parent()->is<TextModifierGroup>())
-    {
-        parent()->as<TextModifierGroup>()->addModifier(this);
-        return StatusCode::Ok;
-    }
+  if (parent() != nullptr && parent()->is<TextModifierGroup>())
+  {
+#ifndef WITH_RIVE_EDITOR
+    // Runtime-only; editor build registers via editorParentChanged.
+    parent()->as<TextModifierGroup>()->addModifier(this);
+#endif
+    return StatusCode::Ok;
+  }
 
-    return StatusCode::MissingObject;
+  return StatusCode::MissingObject;
 }

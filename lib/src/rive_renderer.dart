@@ -3,6 +3,7 @@ import 'dart:typed_data';
 import 'dart:ui' as ui;
 
 import 'package:flutter/rendering.dart' as flutter;
+import 'package:meta/meta.dart';
 import 'package:rive_native/rive_text.dart' as common;
 import 'package:rive_native/rive_native.dart';
 import 'package:rive_native/rive_text.dart';
@@ -17,6 +18,10 @@ enum PaintingStyle {
 }
 
 enum PathFillType { nonZero, evenOdd, clockWise }
+
+/// Where a stroke sits relative to its path's edge. Indices match
+/// rive::StrokePosition.
+enum StrokePosition { inside, center, outside }
 
 abstract class RenderGradient {
   final Vec2D start;
@@ -36,6 +41,18 @@ class RenderLinearGradient extends RenderGradient {
   RenderLinearGradient(super.start, this.end, super.colors, super.stops);
 }
 
+/// A sweep (conic) gradient: the stops run around [start] rather than along a
+/// line or out to a radius.
+///
+/// It carries an [end] like the linear one even though
+/// `Factory::makeAngularGradient` takes no geometry yet, so that the wire
+/// format is the linear one with a different flag, and so the points are
+/// already there when the factory grows a centre and an angle.
+class RenderAngularGradient extends RenderGradient {
+  final Vec2D end;
+  RenderAngularGradient(super.start, this.end, super.colors, super.stops);
+}
+
 abstract class RenderPaint {
   ui.Color get color;
   set color(ui.Color value);
@@ -52,11 +69,18 @@ abstract class RenderPaint {
   ui.StrokeCap get cap;
   set cap(ui.StrokeCap value);
 
+  /// Renderers that don't support inside/outside strokes draw them centered.
+  StrokePosition get strokePosition;
+  set strokePosition(StrokePosition value);
+
   ui.BlendMode get blendMode;
   set blendMode(ui.BlendMode value);
 
   RenderGradient? get gradient;
   set gradient(RenderGradient? gradient);
+
+  Mat2D get gradientTransform;
+  set gradientTransform(Mat2D value);
 
   void dispose();
 
@@ -65,6 +89,29 @@ abstract class RenderPaint {
 
   double get feather;
   set feather(double value);
+
+  /// Interpolates the srcOver composite toward additive: 0 is normal srcOver,
+  /// 1 is fully additive. Only honored when [blendMode] is srcOver; renderers
+  /// that don't support it render plain srcOver.
+  double get additiveness;
+  set additiveness(double value);
+
+  /// Paint the path with [image] modulated (multiplied) by this paint's color
+  /// or gradient. [transform] maps the image's normalized texture space (0..1)
+  /// into the space the path is drawn in. Pass a null [image] to clear any
+  /// previously set modulating image. Default no-op for renderers that don't
+  /// support image paints (matches rive::RenderPaint::modulatedImage).
+  void modulatedImage(
+      RenderImage? image, ImageSampler sampler, Mat2D transform) {}
+
+  /// Like [modulatedImage], with [source]'s artboard as the image: rasterized
+  /// offscreen for [renderer] when it changed. [transform] maps the
+  /// artboard's box, as 0..1, into the space the path is drawn in. Returns
+  /// false, leaving this paint untouched, when the renderer cannot rasterize
+  /// offscreen; the caller then clears any stale image.
+  bool modulatedArtboard(Renderer renderer, ArtboardPaintSource source,
+          ImageSampler sampler, Mat2D transform) =>
+      false;
 }
 
 enum TrimPathMode { none, sequential, synchronized }
@@ -341,8 +388,119 @@ abstract class VertexRenderBuffer extends RenderBuffer {
   void setVertices(Float32List vertices);
 }
 
+class ImageMeshInstance {
+  Mat2D transform = Mat2D();
+  double uvTranslateX = 0;
+  double uvTranslateY = 0;
+  double uvScaleX = 1;
+  double uvScaleY = 1;
+  double opacity = 1;
+  double additiveness = 0;
+}
+
+abstract class ImageMeshInstances {
+  ImageMeshInstances(int count)
+      : instances =
+            List<ImageMeshInstance>.generate(count, (_) => ImageMeshInstance());
+
+  List<ImageMeshInstance> instances;
+
+  // The native rive::ImageMeshInstanceData struct consists of this many
+  // floats. renderer_binding.cpp asserts the struct against this layout.
+  static const int floatsPerInstance = 12;
+
+  @protected
+  void writeTo(Float32List out) {
+    var i = 0;
+    for (final instance in instances) {
+      final transform = instance.transform;
+      for (var j = 0; j < 6; j++) {
+        out[i++] = transform[j];
+      }
+      out[i++] = instance.uvTranslateX;
+      out[i++] = instance.uvTranslateY;
+      out[i++] = instance.uvScaleX;
+      out[i++] = instance.uvScaleY;
+      out[i++] = instance.opacity;
+      out[i++] = instance.additiveness;
+    }
+  }
+
+  void dispose();
+}
+
 abstract class FlutterRenderer {
   flutter.Canvas get canvas;
+}
+
+/// Layer masking on a Flutter canvas, which has the primitives natively:
+/// `saveLayer` for the offscreen and `dstIn`/`dstOut` for the combine. No
+/// native call and no offscreen plumbing of our own.
+///
+/// This is not the design stage -- that draws through the Rive renderer -- but
+/// it IS artboard thumbnails when GPU readback fails, the icon atlas, the
+/// colour loupe and MCP capture. Without it those would disagree with the
+/// stage.
+///
+/// The saveLayer/restore pairs are issued straight on the canvas, never through
+/// the native save()/restore(), which also push an opacity-stack entry.
+mixin FlutterMaskRenderer on Renderer implements FlutterRenderer {
+  final List<MaskMode> _openMaskModes = [];
+
+  // Rec.601, matching lum_from_rgb in the runtime's shaders, so a luminance
+  // mask reads the same here as it does in playback. Skia's own luma filter is
+  // Rec.709; using it would make thumbnails drift from the stage.
+  static const List<double> _lumaToAlpha = <double>[
+    0, 0, 0, 0, 0, //
+    0, 0, 0, 0, 0, //
+    0, 0, 0, 0, 0, //
+    0.30, 0.59, 0.11, 0, 0,
+  ];
+
+  @override
+  bool beginMask(MaskMode mode, AABB bounds,
+      {double resolution = 1, int handle = 0}) {
+    // resolution and handle are ignored: Flutter picks the layer's own
+    // resolution, and there is no raster of ours to retain between frames.
+    canvas.saveLayer(
+      flutter.Rect.fromLTRB(bounds[0], bounds[1], bounds[2], bounds[3]),
+      flutter.Paint(),
+    );
+    _openMaskModes.add(mode);
+    return true;
+  }
+
+  @override
+  void beginMaskSource() {
+    if (_openMaskModes.isEmpty) {
+      return;
+    }
+    final mode = _openMaskModes.last;
+    final keepsWhereMaskIs =
+        mode == MaskMode.alpha || mode == MaskMode.luminance;
+    final usesLuminance =
+        mode == MaskMode.luminance || mode == MaskMode.invertedLuminance;
+    canvas.saveLayer(
+      null,
+      flutter.Paint()
+        ..blendMode = keepsWhereMaskIs
+            ? flutter.BlendMode.dstIn
+            : flutter.BlendMode.dstOut
+        ..colorFilter = usesLuminance
+            ? const flutter.ColorFilter.matrix(_lumaToAlpha)
+            : null,
+    );
+  }
+
+  @override
+  void endMask() {
+    if (_openMaskModes.isEmpty) {
+      return;
+    }
+    _openMaskModes.removeLast();
+    canvas.restore(); // the mask source layer
+    canvas.restore(); // the content layer
+  }
 }
 
 enum Fit {
@@ -384,18 +542,97 @@ enum Fit {
   layout,
 }
 
+/// How an image is filtered when sampled.
+enum ImageSamplerFilter { bilinear, nearest }
+
+/// How texture coordinates outside 0..1 are handled when an image is sampled.
+enum ImageSamplerWrap { clamp, repeat, mirror }
+
+/// Sampling options applied when drawing an image, mirrors the native
+/// rive::ImageSampler.
+class ImageSampler {
+  final ImageSamplerWrap wrapX;
+  final ImageSamplerWrap wrapY;
+  final ImageSamplerFilter filter;
+
+  const ImageSampler({
+    this.wrapX = ImageSamplerWrap.clamp,
+    this.wrapY = ImageSamplerWrap.clamp,
+    this.filter = ImageSamplerFilter.bilinear,
+  });
+
+  static const ImageSampler linearClamp = ImageSampler();
+
+  /// Packed key matching rive::ImageSampler::asKey.
+  int get key =>
+      wrapX.index +
+      wrapY.index * ImageSamplerWrap.values.length +
+      filter.index *
+          ImageSamplerWrap.values.length *
+          ImageSamplerWrap.values.length;
+
+  factory ImageSampler.fromKey(int key) {
+    final wraps = ImageSamplerWrap.values;
+    final filters = ImageSamplerFilter.values;
+    return ImageSampler(
+      wrapX: wraps[key % wraps.length],
+      wrapY: wraps[(key ~/ wraps.length) % wraps.length],
+      filter: filters[(key ~/ (wraps.length * wraps.length)) % filters.length],
+    );
+  }
+}
+
+/// How a layer mask's coverage becomes a multiplier on the content it masks.
+/// Mirrors rive::LayerMaskMode and the enumValues order in
+/// dev/defs/layer_mask.json.
+enum MaskMode {
+  alpha,
+  invertedAlpha,
+  luminance,
+  invertedLuminance,
+}
+
 abstract class Renderer {
   Factory get riveFactory;
   void drawPath(RenderPath path, RenderPaint paint);
-  void drawImage(
-      RenderImage image, flutter.BlendMode blendMode, double opacity);
+  void drawImage(RenderImage image, flutter.BlendMode blendMode, double opacity,
+      {ImageSampler sampler = ImageSampler.linearClamp,
+      double additiveness = 0});
   void drawImageMesh(
       RenderImage image,
       VertexRenderBuffer vertices,
       VertexRenderBuffer uvs,
       IndexRenderBuffer indices,
       flutter.BlendMode blendMode,
-      double opacity);
+      double opacity,
+      {ImageSampler sampler = ImageSampler.linearClamp,
+      double additiveness = 0});
+
+  /// This default implementation just calls drawImageMesh N times.
+  /// Implementations which call into the Rive renderer should override this.
+  void drawImageMeshInstanced(
+      RenderImage image,
+      VertexRenderBuffer vertices,
+      VertexRenderBuffer uvs,
+      IndexRenderBuffer indices,
+      ImageMeshInstances instances,
+      {ImageSampler sampler = ImageSampler.linearClamp}) {
+    for (final instance in instances.instances) {
+      save();
+      transform(instance.transform);
+      drawImageMesh(
+          image,
+          vertices,
+          uvs,
+          indices,
+          flutter.BlendMode.srcOver,
+          instance.opacity,
+          sampler: sampler,
+          additiveness: instance.additiveness,
+      );
+      restore();
+    }
+  }
 
   /// Draw a RenderText, supply [paint] to override styles provided during text
   /// building.
@@ -406,6 +643,29 @@ abstract class Renderer {
   void transform(Mat2D matrix);
   void modulateOpacity(double opacity);
 
+  /// Opens a layer-mask bracket. Everything drawn until [beginMaskSource] is
+  /// the masked content; everything from there until [endMask] is the mask
+  /// source. [endMask] composites content x coverage into this renderer.
+  ///
+  /// [bounds] is the region to rasterize, in the CURRENT renderer space;
+  /// [resolution] is a quality multiplier on the device pixels it covers,
+  /// matching LayerMask.resolution.
+  ///
+  /// Returns false when this renderer cannot mask, in which case the caller
+  /// draws the content inline and must NOT call the other two. Default
+  /// implementation says no, so a renderer without offscreen support leaves the
+  /// layer unmasked -- visible, but not wrong.
+  bool beginMask(MaskMode mode, AABB bounds,
+          {double resolution = 1, int handle = 0}) =>
+      false;
+
+  /// Ends the content half and begins the mask half. Only legal after a
+  /// [beginMask] that returned true.
+  void beginMaskSource() {}
+
+  /// Ends the mask half and composites the result.
+  void endMask() {}
+
   void scale(double sx, [double? sy]) =>
       transform(Mat2D.fromScale(sx, sy ?? sx));
 
@@ -414,6 +674,12 @@ abstract class Renderer {
 
   /// Makes a Renderer for a Flutter Canvas.
   static Renderer make(flutter.Canvas canvas) => makeFlutterRenderer(canvas);
+
+  /// A key for one mask's retained offscreen canvases, so a mask does not
+  /// re-allocate its textures every frame. Owned by whatever authors the mask
+  /// and handed back with [releaseMaskHandle] when it goes away.
+  static int acquireMaskHandle() => acquireLayerMaskHandle();
+  static void releaseMaskHandle(int handle) => releaseLayerMaskHandle(handle);
 
   static TrimPathEffect makeTrimPath() => makeTrimPathEffect();
   static DashPathEffect makeDashPath() => makeDashPathEffect();
@@ -578,11 +844,50 @@ abstract class RawTextInput {
   TextOverflow get overflow;
   set overflow(TextOverflow value);
 
+  TextAlign get align;
+  set align(TextAlign value);
+
+  /// The width lines are aligned within when it's wider than the text itself.
+  /// Text wider than this aligns within its own width, which effectively left
+  /// aligns it (and leaves horizontal scrolling intact).
+  double get alignWidth;
+  set alignWidth(double value);
+
+  VerticalTextAlign get verticalAlign;
+  set verticalAlign(VerticalTextAlign value);
+
+  /// The height the text block is aligned within, the vertical counterpart to
+  /// [alignWidth]: text taller than this stays at the top, leaving vertical
+  /// scrolling intact.
+  double get alignHeight;
+  set alignHeight(double value);
+
   double get selectionCornerRadius;
   set selectionCornerRadius(double value);
 
   bool get separateSelectionText;
   set separateSelectionText(bool value);
+
+  /// When true every code point displays as a bullet while the real text
+  /// stays intact for editing.
+  bool get obscured;
+  set obscured(bool value);
+
+  /// Most code points an insert lets the text grow to, 0 for no limit. Text
+  /// set from outside and undo/redo are kept as they are, even when over it.
+  int get maxCharacters;
+  set maxCharacters(int value);
+
+  /// Most displayed (wrapped) lines an insert lets the text grow to, 0 for no
+  /// limit. Held to edits only, like [maxCharacters].
+  int get maxLines;
+  set maxLines(int value);
+
+  /// Whether the layout hugs the text's width, so the field grows with its
+  /// text up to the width [measure] was last offered: [maxLines] then wraps
+  /// there. Otherwise it wraps at [maxWidth], where the text displays.
+  bool get hugsWidth;
+  set hugsWidth(bool value);
 
   String get text;
   set text(String value);

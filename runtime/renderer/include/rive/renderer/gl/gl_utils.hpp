@@ -12,6 +12,10 @@
 
 namespace glutils
 {
+// GL has no base vertex for indexed draws, so draws that need one set this
+// uniform instead.
+constexpr static char BASE_VERTEX_UNIFORM_NAME[] = "_baseVertex";
+
 // Used when the driver doesn't support gl_BaseInstance
 // (GLCapabilities::ANGLE_base_vertex_base_instance_shader_builtin is false).
 //
@@ -29,8 +33,8 @@ void PrintLinkProgramErrors(GLuint program);
 
 enum class DebugPrintErrorAndAbort
 {
-    no,
-    yes,
+  no,
+  yes,
 };
 
 void CompileAndAttachShader(
@@ -70,202 +74,292 @@ void CompileAndAttachShader(
     const char* rawGLSL,
     DebugPrintErrorAndAbort = DebugPrintErrorAndAbort::yes);
 
-void LinkProgram(GLuint program,
-                 DebugPrintErrorAndAbort = DebugPrintErrorAndAbort::yes);
+void LinkProgram(
+    GLuint program,
+    DebugPrintErrorAndAbort = DebugPrintErrorAndAbort::yes);
+
+// Threaded wasm reaches one heap from several contexts, and a GL name means
+// nothing outside the context that made it: every context numbers from 1.
+#ifdef __EMSCRIPTEN_PTHREADS__
+#define RIVE_GL_NAMES_ARE_PER_CONTEXT
+#endif
+
+enum class GLObjectType
+{
+  buffer,
+  texture,
+  framebuffer,
+  renderbuffer,
+  vertexArray,
+  shader,
+  program,
+};
+
+using GLContextID = int;
+
+#ifdef RIVE_GL_NAMES_ARE_PER_CONTEXT
+GLContextID CurrentContextID();
+
+// Deletes the names other threads left behind for whichever context is current.
+void ReclaimAbandonedNames();
+
+// Process wide, for tests: names left to their owning context, and names that
+// owner has since deleted.
+uint32_t AbandonedNameCount();
+uint32_t ReclaimedNameCount();
+#else
+// A process with a single context can always delete what it created.
+constexpr GLContextID CurrentContextID() { return 0; }
+inline void ReclaimAbandonedNames() {}
+#endif
 
 class GLObject
 {
 public:
-    GLObject() = default;
-    GLObject(GLObject&& rhs) : m_id(std::exchange(rhs.m_id, 0)) {}
+  GLObject() = default;
+  GLObject(GLObject&& rhs)
+      : m_id(std::exchange(rhs.m_id, 0))
+#ifdef RIVE_GL_NAMES_ARE_PER_CONTEXT
+      , m_context(rhs.m_context)
+#endif
+  {}
 
-    GLObject(const GLObject&) = delete;
-    GLObject& operator=(const GLObject&) = delete;
+  GLObject(const GLObject&) = delete;
+  GLObject& operator=(const GLObject&) = delete;
 
-    operator GLuint() const { return m_id; }
+  operator GLuint() const { return m_id; }
 
 protected:
-    explicit GLObject(GLuint adoptedID) : m_id(adoptedID) {}
+  explicit GLObject(GLuint adoptedID) : m_id(adoptedID) {}
 
-    GLuint m_id = 0;
+  // Deletes m_id, on the context that created it.
+  void destroy(GLObjectType);
+  // Deletes m_id and takes over rhs's name and the context it belongs to.
+  void adopt(GLObjectType, GLObject&& rhs);
+  // Deletes m_id and takes over a name generated on the current context.
+  void adoptName(GLObjectType, GLuint adoptedID);
+
+  GLuint m_id = 0;
+#ifdef RIVE_GL_NAMES_ARE_PER_CONTEXT
+  GLContextID m_context = CurrentContextID();
+#endif
 };
 
 class Buffer : public GLObject
 {
 public:
-    Buffer() { glGenBuffers(1, &m_id); }
-    ~Buffer() { glDeleteBuffers(1, &m_id); }
+  Buffer() { glGenBuffers(1, &m_id); }
+  ~Buffer() { destroy(GLObjectType::buffer); }
 };
 
 class Texture : public GLObject
 {
 public:
-    Texture() { glGenTextures(1, &m_id); }
-    Texture(Texture&& rhs) : GLObject(std::move(rhs)) {}
-    Texture& operator=(Texture&& rhs)
-    {
-        reset(std::exchange(rhs.m_id, 0));
-        return *this;
-    }
-    ~Texture() { reset(0); }
+  Texture() { glGenTextures(1, &m_id); }
+  Texture(Texture&& rhs) : GLObject(std::move(rhs)) {}
+  Texture& operator=(Texture&& rhs)
+  {
+    adopt(GLObjectType::texture, std::move(rhs));
+    return *this;
+  }
+  ~Texture() { destroy(GLObjectType::texture); }
 
-    static Texture Zero() { return Texture(0); }
-    static Texture Adopt(GLuint id) { return Texture(id); }
+  static Texture Zero() { return Texture(0); }
+  static Texture Adopt(GLuint id) { return Texture(id); }
 
 private:
-    explicit Texture(GLuint adoptedID) : GLObject(adoptedID) {}
+  explicit Texture(GLuint adoptedID) : GLObject(adoptedID) {}
+};
 
-    void reset(GLuint adoptedID)
+class Fence
+{
+public:
+  Fence() = default;
+  Fence(Fence&& rhs)
+      : m_sync(std::exchange(rhs.m_sync, nullptr))
+      , m_insertFailed(std::exchange(rhs.m_insertFailed, false))
+  {}
+  Fence& operator=(Fence&& rhs)
+  {
+    reset();
+    m_sync = std::exchange(rhs.m_sync, nullptr);
+    m_insertFailed = std::exchange(rhs.m_insertFailed, false);
+    return *this;
+  }
+  Fence(const Fence&) = delete;
+  Fence& operator=(const Fence&) = delete;
+  ~Fence() { reset(); }
+
+  // Replaces any pending fence with one at the current point in the command
+  // stream.
+  void insert()
+  {
+    reset();
+    m_sync = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+    // Out of memory, or the context is gone. poll() can't vouch for this
+    // point in the stream, so it reports it as still pending.
+    m_insertFailed = m_sync == nullptr;
+  }
+
+  // Returns true if nothing is pending (i.e., no fence, or it signaled).
+  // NOTE: There is no "wait(timeout)" function because WebGL2 only supports
+  // polling.
+  bool poll()
+  {
+    if (m_insertFailed)
     {
-        if (m_id != 0)
-        {
-            glDeleteTextures(1, &m_id);
-        }
-        m_id = adoptedID;
+      return false;
     }
+    if (m_sync != nullptr)
+    {
+      GLenum status = glClientWaitSync(m_sync, 0, 0);
+      return status == GL_ALREADY_SIGNALED || status == GL_CONDITION_SATISFIED;
+    }
+    return true;
+  }
+
+  void reset()
+  {
+    if (m_sync != nullptr)
+    {
+      glDeleteSync(m_sync);
+      m_sync = nullptr;
+    }
+    m_insertFailed = false;
+  }
+
+private:
+  GLsync m_sync = nullptr;
+  bool m_insertFailed = false;
 };
 
 class Framebuffer : public GLObject
 {
 public:
-    Framebuffer() { glGenFramebuffers(1, &m_id); }
-    Framebuffer(Framebuffer&& rhs) : GLObject(std::move(rhs)) {}
-    Framebuffer& operator=(Framebuffer&& rhs)
-    {
-        reset(std::exchange(rhs.m_id, 0));
-        return *this;
-    }
-    ~Framebuffer() { reset(0); }
+  Framebuffer() { glGenFramebuffers(1, &m_id); }
+  Framebuffer(Framebuffer&& rhs) : GLObject(std::move(rhs)) {}
+  Framebuffer& operator=(Framebuffer&& rhs)
+  {
+    adopt(GLObjectType::framebuffer, std::move(rhs));
+    return *this;
+  }
+  ~Framebuffer() { destroy(GLObjectType::framebuffer); }
 
-    static Framebuffer Zero() { return Framebuffer(0); }
+  static Framebuffer Zero() { return Framebuffer(0); }
 
 private:
-    explicit Framebuffer(GLuint adoptedID) : GLObject(adoptedID) {}
-
-    void reset(GLuint adoptedID)
-    {
-        if (m_id != 0)
-        {
-            glDeleteFramebuffers(1, &m_id);
-        }
-        m_id = adoptedID;
-    }
+  explicit Framebuffer(GLuint adoptedID) : GLObject(adoptedID) {}
 };
 
 class Renderbuffer : public GLObject
 {
 public:
-    Renderbuffer() { glGenRenderbuffers(1, &m_id); }
-    Renderbuffer(Renderbuffer&& rhs) : GLObject(std::move(rhs)) {}
-    Renderbuffer& operator=(Renderbuffer&& rhs)
-    {
-        reset(std::exchange(rhs.m_id, 0));
-        return *this;
-    }
-    ~Renderbuffer() { reset(0); }
+  Renderbuffer() { glGenRenderbuffers(1, &m_id); }
+  Renderbuffer(Renderbuffer&& rhs) : GLObject(std::move(rhs)) {}
+  Renderbuffer& operator=(Renderbuffer&& rhs)
+  {
+    adopt(GLObjectType::renderbuffer, std::move(rhs));
+    return *this;
+  }
+  ~Renderbuffer() { destroy(GLObjectType::renderbuffer); }
 
-    static Renderbuffer Zero() { return Renderbuffer(0); }
+  static Renderbuffer Zero() { return Renderbuffer(0); }
 
 private:
-    explicit Renderbuffer(GLuint adoptedID) : GLObject(adoptedID) {}
-
-    void reset(GLuint adoptedID)
-    {
-        if (m_id != 0)
-        {
-            glDeleteRenderbuffers(1, &m_id);
-        }
-        m_id = adoptedID;
-    }
+  explicit Renderbuffer(GLuint adoptedID) : GLObject(adoptedID) {}
 };
 
 class VAO : public GLObject
 {
 public:
-    VAO() { glGenVertexArrays(1, &m_id); }
-    ~VAO() { glDeleteVertexArrays(1, &m_id); }
+  VAO() { glGenVertexArrays(1, &m_id); }
+  ~VAO() { destroy(GLObjectType::vertexArray); }
 };
 
 class Shader : public GLObject
 {
 public:
-    Shader() = default;
-    Shader(Shader&& rhs) : GLObject(std::move(rhs)) {}
-    Shader& operator=(Shader&& rhs)
-    {
-        reset(std::exchange(rhs.m_id, 0));
-        return *this;
-    }
-    ~Shader() { reset(0); }
+  Shader() = default;
+  Shader(Shader&& rhs) : GLObject(std::move(rhs)) {}
+  Shader& operator=(Shader&& rhs)
+  {
+    adopt(GLObjectType::shader, std::move(rhs));
+    return *this;
+  }
+  ~Shader() { destroy(GLObjectType::shader); }
 
-    void compile(GLenum type,
-                 const char* source,
-                 const GLCapabilities& capabilities)
-    {
-        compile(type, nullptr, 0, &source, 1, capabilities);
-    }
-    void compile(GLenum type,
-                 const char* defines[],
-                 size_t numDefines,
-                 const char* sources[],
-                 size_t numSources,
-                 const GLCapabilities&);
+  void compile(
+      GLenum type,
+      const char* source,
+      const GLCapabilities& capabilities)
+  {
+    compile(type, nullptr, 0, &source, 1, capabilities);
+  }
+  void compile(
+      GLenum type,
+      const char* defines[],
+      size_t numDefines,
+      const char* sources[],
+      size_t numSources,
+      const GLCapabilities&);
 
-    void reset(GLuint adoptedID = 0)
-    {
-        if (m_id != 0)
-        {
-            glDeleteShader(m_id);
-        }
-        m_id = adoptedID;
-    }
+  void reset(GLuint adoptedID = 0)
+  {
+    adoptName(GLObjectType::shader, adoptedID);
+  }
 };
 
 class Program : public GLObject
 {
 public:
-    Program() : GLObject(glCreateProgram()) {}
-    Program& operator=(Program&& rhs)
-    {
-        reset(std::exchange(rhs.m_id, 0));
-        m_vertexShader = std::move(rhs.m_vertexShader);
-        m_fragmentShader = std::move(rhs.m_fragmentShader);
-        return *this;
-    }
-    ~Program() { reset(0); }
+  Program() : GLObject(glCreateProgram()) {}
+  Program& operator=(Program&& rhs)
+  {
+    adopt(GLObjectType::program, std::move(rhs));
+    m_vertexShader = std::move(rhs.m_vertexShader);
+    m_fragmentShader = std::move(rhs.m_fragmentShader);
+    return *this;
+  }
+  ~Program() { destroy(GLObjectType::program); }
 
-    void compileAndAttachShader(GLenum type,
-                                const char* source,
-                                const GLCapabilities& capabilities)
-    {
-        compileAndAttachShader(type, nullptr, 0, &source, 1, capabilities);
-    }
-    void compileAndAttachShader(GLenum type,
-                                const char* defines[],
-                                size_t numDefines,
-                                const char* sources[],
-                                size_t numSources,
-                                const GLCapabilities&);
+  void compileAndAttachShader(
+      GLenum type,
+      const char* source,
+      const GLCapabilities& capabilities)
+  {
+    compileAndAttachShader(type, nullptr, 0, &source, 1, capabilities);
+  }
+  void compileAndAttachShader(
+      GLenum type,
+      const char* defines[],
+      size_t numDefines,
+      const char* sources[],
+      size_t numSources,
+      const GLCapabilities&);
 
-    void link() { LinkProgram(m_id); }
+  void link() { LinkProgram(m_id); }
 
-    static Program Zero() { return Program(0); }
+  static Program Zero() { return Program(0); }
 
 private:
-    explicit Program(GLuint adoptedID) : GLObject(adoptedID) {}
+  explicit Program(GLuint adoptedID) : GLObject(adoptedID) {}
 
-    void reset(GLuint adoptedProgramID);
-
-    glutils::Shader m_vertexShader;
-    glutils::Shader m_fragmentShader;
+  glutils::Shader m_vertexShader;
+  glutils::Shader m_fragmentShader;
 };
 
-void SetTexture2DSamplingParams(GLenum minFilter, GLenum magFilter);
+void SetTexture2DSamplingParams(
+    GLenum minFilter,
+    GLenum magFilter,
+    GLint wrapU = GL_CLAMP_TO_EDGE,
+    GLint wrapV = GL_CLAMP_TO_EDGE);
 void SetTexture2DSamplingParams(rive::ImageSampler);
 
-void BlitFramebuffer(rive::IAABB bounds,
-                     uint32_t renderTargetHeight,
-                     GLbitfield mask = GL_COLOR_BUFFER_BIT);
+void BlitFramebuffer(
+    rive::IAABB bounds,
+    uint32_t renderTargetHeight,
+    bool bottomUp,
+    GLbitfield mask = GL_COLOR_BUFFER_BIT);
 
 void Uniform1iByName(GLuint programID, const char* name, GLint value);
 } // namespace glutils

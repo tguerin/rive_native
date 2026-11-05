@@ -1,6 +1,8 @@
 #include "rive/renderer/gpu.hpp"
 #include "rive/renderer/vulkan/vkutil.hpp"
 #include "shaders/constants.glsl"
+#include "image_draw_attributes.hpp"
+
 #include <array>
 #include <vulkan/vulkan.h>
 
@@ -11,6 +13,12 @@ namespace rive::gpu::layout
 // requires the most attachments in a single pass: all 4 PLS planes plus one
 // more resolve target.
 constexpr static uint32_t MAX_RENDER_PASS_ATTACHMENTS = PLS_PLANE_COUNT + 1;
+
+constexpr VkPipelineVertexInputStateCreateInfo EMPTY_VERTEX_INPUT_STATE = {
+    .sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
+    .vertexBindingDescriptionCount = 0,
+    .vertexAttributeDescriptionCount = 0,
+};
 
 constexpr VkVertexInputBindingDescription PATH_INPUT_BINDINGS[] = {{
     .binding = 0,
@@ -57,51 +65,94 @@ constexpr VkPipelineVertexInputStateCreateInfo INTERIOR_TRI_VERTEX_INPUT_STATE =
         .sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
         .vertexBindingDescriptionCount = std::size(INTERIOR_TRI_INPUT_BINDINGS),
         .pVertexBindingDescriptions = INTERIOR_TRI_INPUT_BINDINGS,
-        .vertexAttributeDescriptionCount =
-            std::size(INTERIOR_TRI_VERTEX_ATTRIBS),
+        .vertexAttributeDescriptionCount = std::size(
+            INTERIOR_TRI_VERTEX_ATTRIBS),
         .pVertexAttributeDescriptions = INTERIOR_TRI_VERTEX_ATTRIBS,
 };
 
-// Concatenates the given geometryAttribs with Rive's ImageDrawInstance attribs
-// (bound at 'binding').
-template <typename... GeometryAttribs>
-constexpr std::array<VkVertexInputAttributeDescription,
-                     sizeof...(GeometryAttribs) + IMAGE_ATTRIB_COUNT>
-appendImageDrawInstanceAttribs(uint32_t binding,
-                               GeometryAttribs... geometryAttribs)
+constexpr VkFormat getVkFormat(VertexElementFormat format)
 {
-    return {{
-        geometryAttribs...,
-        {
-            .location = IMAGE_VIEW_MATRIX_ATTRIB_IDX,
-            .binding = binding,
-            .format = VK_FORMAT_R32G32B32A32_SFLOAT,
-            .offset = (IMAGE_VIEW_MATRIX_ATTRIB_IDX - IMAGE_FIRST_ATTRIB_IDX) *
-                      sizeof(uint32_t) * 4,
-        },
-        {
-            .location = IMAGE_CLIP_RECT_INVERSE_MATRIX_ATTRIB_IDX,
-            .binding = binding,
-            .format = VK_FORMAT_R32G32B32A32_SFLOAT,
-            .offset = (IMAGE_CLIP_RECT_INVERSE_MATRIX_ATTRIB_IDX -
-                       IMAGE_FIRST_ATTRIB_IDX) *
-                      sizeof(uint32_t) * 4,
-        },
-        {
-            .location = IMAGE_TRANSLATES_ATTRIB_IDX,
-            .binding = binding,
-            .format = VK_FORMAT_R32G32B32A32_SFLOAT,
-            .offset = (IMAGE_TRANSLATES_ATTRIB_IDX - IMAGE_FIRST_ATTRIB_IDX) *
-                      sizeof(uint32_t) * 4,
-        },
-        {
-            .location = IMAGE_PACKED_ATTRIBS_IDX,
-            .binding = binding,
-            .format = VK_FORMAT_R32G32B32A32_UINT,
-            .offset = (IMAGE_PACKED_ATTRIBS_IDX - IMAGE_FIRST_ATTRIB_IDX) *
-                      sizeof(uint32_t) * 4,
-        },
-    }};
+  switch (format)
+  {
+    case VertexElementFormat::float1:
+      return VK_FORMAT_R32_SFLOAT;
+    case VertexElementFormat::float2:
+      return VK_FORMAT_R32G32_SFLOAT;
+    case VertexElementFormat::float3:
+      return VK_FORMAT_R32G32B32_SFLOAT;
+    case VertexElementFormat::float4:
+      return VK_FORMAT_R32G32B32A32_SFLOAT;
+    case VertexElementFormat::uint8x4:
+      return VK_FORMAT_R8G8B8A8_UINT;
+    case VertexElementFormat::sint8x4:
+      return VK_FORMAT_R8G8B8A8_SINT;
+    case VertexElementFormat::unorm8x4:
+      return VK_FORMAT_R8G8B8A8_UNORM;
+    case VertexElementFormat::snorm8x4:
+      return VK_FORMAT_R8G8B8A8_SNORM;
+    case VertexElementFormat::uint16x2:
+      return VK_FORMAT_R16G16_UINT;
+    case VertexElementFormat::sint16x2:
+      return VK_FORMAT_R16G16_SINT;
+    case VertexElementFormat::unorm16x2:
+      return VK_FORMAT_R16G16_UNORM;
+    case VertexElementFormat::snorm16x2:
+      return VK_FORMAT_R16G16_SNORM;
+    case VertexElementFormat::uint16x4:
+      return VK_FORMAT_R16G16B16A16_UINT;
+    case VertexElementFormat::sint16x4:
+      return VK_FORMAT_R16G16B16A16_SINT;
+    case VertexElementFormat::float16x2:
+      return VK_FORMAT_R16G16_SFLOAT;
+    case VertexElementFormat::float16x4:
+      return VK_FORMAT_R16G16B16A16_SFLOAT;
+    case VertexElementFormat::uint32:
+      return VK_FORMAT_R32_UINT;
+  }
+}
+
+// Grab these from image_draw_attributes.hpp so that it's constexpr
+template <typename ImageDrawInstance> constexpr auto getImageDrawAttributes()
+{
+  if constexpr (std::is_same_v<ImageDrawInstance, ImageRectInstance>)
+  {
+    return ImageRectInstanceAttributes;
+  }
+  else
+  {
+    static_assert(std::is_same_v<ImageDrawInstance, ImageMeshInstance>);
+    return ImageMeshInstanceAttributes;
+  }
+}
+
+// Concatenates the given geometryAttribs with Rive's ImageRect/MeshInstance
+// attribs (bound at 'binding').
+template <typename ImageDrawInstance, typename... GeometryAttribs>
+constexpr auto appendImageDrawInstanceAttribs(
+    uint32_t binding,
+    GeometryAttribs... geometryAttribs)
+{
+  constexpr auto Attributes = getImageDrawAttributes<ImageDrawInstance>();
+
+  constexpr auto ArrayLength = sizeof...(GeometryAttribs) +
+                               std::size(Attributes);
+  std::array<VkVertexInputAttributeDescription, ArrayLength> attrs = {
+      geometryAttribs...};
+
+  for (auto i = 0u; i < std::size(Attributes); i++)
+  {
+    const auto& src = Attributes[i];
+    auto& dest = attrs[i + sizeof...(GeometryAttribs)];
+
+    dest = {
+        .location = src.attributeIndex,
+        .binding = binding,
+        .format = getVkFormat(src.format),
+        .offset = src.byteOffset,
+    };
+  }
+
+  return attrs;
 }
 
 constexpr uint32_t ImageRectGeometryBufferBinding = 0;
@@ -114,18 +165,19 @@ constexpr VkVertexInputBindingDescription ImageRectInputBindings[] = {
     },
     {
         .binding = ImageRectImageAttribBufferBinding,
-        .stride = sizeof(rive::gpu::ImageDrawInstance),
+        .stride = sizeof(rive::gpu::ImageRectInstance),
         .inputRate = VK_VERTEX_INPUT_RATE_INSTANCE,
     },
 };
-constexpr auto ImageRectVertexAttribs = appendImageDrawInstanceAttribs(
-    ImageRectImageAttribBufferBinding,
-    VkVertexInputAttributeDescription{
-        .location = 0,
-        .binding = ImageRectGeometryBufferBinding,
-        .format = VK_FORMAT_R32G32B32A32_SFLOAT,
-        .offset = 0,
-    });
+constexpr auto
+    ImageRectVertexAttribs = appendImageDrawInstanceAttribs<ImageRectInstance>(
+        ImageRectImageAttribBufferBinding,
+        VkVertexInputAttributeDescription{
+            .location = 0,
+            .binding = ImageRectGeometryBufferBinding,
+            .format = VK_FORMAT_R32G32B32A32_SFLOAT,
+            .offset = 0,
+        });
 constexpr VkPipelineVertexInputStateCreateInfo IMAGE_RECT_VERTEX_INPUT_STATE = {
     .sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
     .vertexBindingDescriptionCount = std::size(ImageRectInputBindings),
@@ -150,24 +202,25 @@ constexpr VkVertexInputBindingDescription ImageMeshInputBindings[] = {
     },
     {
         .binding = ImageMeshImageAttribBufferBinding,
-        .stride = sizeof(rive::gpu::ImageDrawInstance),
+        .stride = sizeof(rive::gpu::ImageMeshInstance),
         .inputRate = VK_VERTEX_INPUT_RATE_INSTANCE,
     },
 };
-constexpr auto ImageMeshVertexAttribs =
-    appendImageDrawInstanceAttribs(ImageMeshImageAttribBufferBinding,
-                                   VkVertexInputAttributeDescription{
-                                       .location = 0,
-                                       .binding = ImageMeshVertexBufferBinding,
-                                       .format = VK_FORMAT_R32G32_SFLOAT,
-                                       .offset = 0,
-                                   },
-                                   VkVertexInputAttributeDescription{
-                                       .location = 1,
-                                       .binding = ImageMeshUVBufferBinding,
-                                       .format = VK_FORMAT_R32G32_SFLOAT,
-                                       .offset = 0,
-                                   });
+constexpr auto
+    ImageMeshVertexAttribs = appendImageDrawInstanceAttribs<ImageMeshInstance>(
+        ImageMeshImageAttribBufferBinding,
+        VkVertexInputAttributeDescription{
+            .location = 0,
+            .binding = ImageMeshVertexBufferBinding,
+            .format = VK_FORMAT_R32G32_SFLOAT,
+            .offset = 0,
+        },
+        VkVertexInputAttributeDescription{
+            .location = 1,
+            .binding = ImageMeshUVBufferBinding,
+            .format = VK_FORMAT_R32G32_SFLOAT,
+            .offset = 0,
+        });
 constexpr VkPipelineVertexInputStateCreateInfo IMAGE_MESH_VERTEX_INPUT_STATE = {
     .sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
     .vertexBindingDescriptionCount = std::size(ImageMeshInputBindings),
@@ -176,11 +229,7 @@ constexpr VkPipelineVertexInputStateCreateInfo IMAGE_MESH_VERTEX_INPUT_STATE = {
     .pVertexAttributeDescriptions = ImageMeshVertexAttribs.data(),
 };
 
-constexpr VkPipelineVertexInputStateCreateInfo EMPTY_VERTEX_INPUT_STATE = {
-    .sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
-    .vertexBindingDescriptionCount = 0,
-    .vertexAttributeDescriptionCount = 0,
-};
+constexpr uint32_t MaxVertexBinding = ImageMeshImageAttribBufferBinding;
 
 constexpr VkPipelineInputAssemblyStateCreateInfo INPUT_ASSEMBLY_TRIANGLE_STRIP =
     {
@@ -246,27 +295,6 @@ constexpr VkPipelineDynamicStateCreateInfo DYNAMIC_VIEWPORT_SCISSOR = {
     .sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO,
     .dynamicStateCount = std::size(DYNAMIC_VIEWPORT_SCISSOR_VALUES),
     .pDynamicStates = DYNAMIC_VIEWPORT_SCISSOR_VALUES,
-};
-
-// Used by the combined MSAA fast-path fill (msaaDynamicMidpointFans), which
-// switches its three constituent passes with dynamic state on one pipeline.
-// depthCompareOp stays baked at LESS so the depth test keeps culling (Hi-Z);
-// color is suppressed per pass via VK_EXT_color_write_enable, never the depth
-// test. stencilReference is constant (0x80) so it's baked, not listed here.
-constexpr VkDynamicState DYNAMIC_PIPELINE_STATE_VALUES[] = {
-    VK_DYNAMIC_STATE_VIEWPORT,
-    VK_DYNAMIC_STATE_SCISSOR,
-    VK_DYNAMIC_STATE_DEPTH_WRITE_ENABLE,
-    VK_DYNAMIC_STATE_STENCIL_COMPARE_MASK,
-    VK_DYNAMIC_STATE_STENCIL_WRITE_MASK,
-    VK_DYNAMIC_STATE_STENCIL_OP,
-    VK_DYNAMIC_STATE_CULL_MODE,
-    VK_DYNAMIC_STATE_COLOR_WRITE_ENABLE_EXT,
-};
-constexpr VkPipelineDynamicStateCreateInfo DYNAMIC_PIPELINE_STATE = {
-    .sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO,
-    .dynamicStateCount = std::size(DYNAMIC_PIPELINE_STATE_VALUES),
-    .pDynamicStates = DYNAMIC_PIPELINE_STATE_VALUES,
 };
 
 constexpr VkAttachmentReference SINGLE_ATTACHMENT_SUBPASS_REFERENCE = {

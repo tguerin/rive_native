@@ -1,4 +1,5 @@
 export 'basic.dart';
+export 'deferred.dart';
 export 'data_binding.dart';
 export 'data_binding_artboards.dart';
 export 'error_artboard_does_not_exist.dart';

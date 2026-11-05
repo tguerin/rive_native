@@ -403,10 +403,10 @@ class TextShapeResultFFI extends TextShapeResult {
   }
 
   @override
-  BreakLinesResult breakLines(
-      double width, TextAlign alignment, TextWrap wrap) {
-    return LineDoubleList(
-        breakLinesNative(nativeResult, width, alignment.index, wrap.index));
+  BreakLinesResult breakLines(double width, TextAlign alignment, TextWrap wrap,
+      [TextWordBreak wordBreak = TextWordBreak.breakWord]) {
+    return LineDoubleList(breakLinesNative(
+        nativeResult, width, alignment.index, wrap.index, wordBreak.index));
   }
 
   @override
@@ -463,14 +463,15 @@ final void Function(Pointer<SimpleParagraphArray> font) deleteShapeResult =
             'deleteShapeResult')
         .asFunction();
 
-final Pointer<SimpleLineDoubleList> Function(
-        Pointer<SimpleParagraphArray>, double width, int align, int wrap)
-    breakLinesNative = _nativeLib
+final Pointer<SimpleLineDoubleList> Function(Pointer<SimpleParagraphArray>,
+        double width, int align, int wrap, int wordBreak) breakLinesNative =
+    _nativeLib
         .lookup<
             NativeFunction<
                 Pointer<SimpleLineDoubleList> Function(
                     Pointer<SimpleParagraphArray>,
                     Float,
+                    Uint8,
                     Uint8,
                     Uint8)>>('breakLines')
         .asFunction();
@@ -485,6 +486,25 @@ final Pointer<Void> Function(Pointer<Uint8> bytes, int count) makeFont =
         .lookup<NativeFunction<Pointer<Void> Function(Pointer<Uint8>, Uint64)>>(
             'makeFont')
         .asFunction();
+
+/// Looked up lazily and guarded: a native library predating this export must
+/// leave [decodeFontFile] returning null so callers fall back to decodeFont,
+/// rather than throwing on a missing symbol.
+Pointer<Void> Function(Pointer<Utf8> path)? _makeFontFromFile;
+bool _checkedMakeFontFromFile = false;
+
+Pointer<Void> Function(Pointer<Utf8> path)? get makeFontFromFile {
+  if (!_checkedMakeFontFromFile) {
+    _checkedMakeFontFromFile = true;
+    if (_nativeLib.providesSymbol('makeFontFromFile')) {
+      _makeFontFromFile = _nativeLib
+          .lookup<NativeFunction<Pointer<Void> Function(Pointer<Utf8>)>>(
+              'makeFontFromFile')
+          .asFunction();
+    }
+  }
+  return _makeFontFromFile;
+}
 
 final void Function(Pointer<Void> font) deleteFont = _nativeLib
     .lookup<NativeFunction<Void Function(Pointer<Void>)>>('deleteFont')
@@ -588,6 +608,22 @@ final double Function(Pointer<Void> string) _convertStringToNumber = _nativeLib
 
 final double Function(int value) _convertIntToNumber = _nativeLib
     .lookup<NativeFunction<Float Function(Uint64)>>('convertIntToNumber')
+    .asFunction();
+
+typedef _FormatTemplateNumberNative = Pointer<Utf8> Function(
+    Float value, Pointer<Utf8> spec);
+typedef _FormatTemplateNumber = Pointer<Utf8> Function(
+    double value, Pointer<Utf8> spec);
+
+// Looked up lazily so an older native library without it still loads.
+final _FormatTemplateNumber? _formatTemplateNumber =
+    _nativeLib.providesSymbol('formatTemplateNumber')
+        ? _nativeLib.lookupFunction<_FormatTemplateNumberNative,
+            _FormatTemplateNumber>('formatTemplateNumber')
+        : null;
+
+final void Function(Pointer<Utf8> string) _freeString = _nativeLib
+    .lookup<NativeFunction<Void Function(Pointer<Utf8>)>>('freeString')
     .asFunction();
 
 class RawPathCommandWasm extends RawPathCommand {
@@ -1109,6 +1145,25 @@ Font? decodeFont(Uint8List bytes) {
   return StrongFontFFI(result);
 }
 
+/// Maps the font at [path] rather than reading it into memory. Null when the
+/// platform has no file mapping, so callers fall back to [decodeFont].
+Font? decodeFontFile(String path) {
+  // Bail before allocating: an older native library has no such export.
+  final make = makeFontFromFile;
+  if (make == null) {
+    return null;
+  }
+
+  final nativePath = path.toNativeUtf8();
+  final result = make(nativePath);
+  calloc.free(nativePath);
+  if (result == nullptr) {
+    return null;
+  }
+
+  return StrongFontFFI(result);
+}
+
 Future<bool> initFont() async {
   init();
   return true;
@@ -1142,6 +1197,23 @@ class TextHelperFFI extends TextHelper {
   double convertIntToNumber(int value) {
     var num = _convertIntToNumber(value);
     return num;
+  }
+
+  @override
+  String? formatTemplateNumber(double value, String spec) {
+    final format = _formatTemplateNumber;
+    if (format == null) {
+      return null;
+    }
+    final nativeSpec = spec.toNativeUtf8();
+    final result = format(value, nativeSpec);
+    malloc.free(nativeSpec);
+    if (result == nullptr) {
+      return null;
+    }
+    final text = result.toDartString();
+    _freeString(result);
+    return text;
   }
 }
 

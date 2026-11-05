@@ -1,4 +1,10 @@
 Module["onRuntimeInitialized"] = function () {
+  // Always read the live buffer: under memory growth a cached heap view
+  // detaches, and atomics on a detached view throw.
+  function heapBuffer() {
+    return Module["wasmMemory"]["buffer"];
+  }
+
   const makeRenderer = Module["makeRenderer"];
   const cppDeleteRenderer = Module["deleteRenderer"];
   let _offscreenGL = null;
@@ -39,9 +45,26 @@ Module["onRuntimeInitialized"] = function () {
 
     GL.makeContextCurrent(handle);
 
+    // RenderContextGLImpl::MakeContext can still fail on a context the
+    // browser handed out. Give the context straight back rather than keeping
+    // a slot of the page's budget for a renderer that does not exist. Safe to
+    // deleteContext here: C++ never saw this context, so nothing uploaded to
+    // it can outlive it.
+    var ptr = makeRenderer(canvas.width, canvas.height);
+    if (!ptr) {
+      var lose = gl.getExtension("WEBGL_lose_context");
+      if (lose) {
+        lose.loseContext();
+      }
+      if (GL.deleteContext) {
+        GL.deleteContext(handle);
+      }
+      return null;
+    }
+
     _liveGLContexts++;
     return {
-      "_ptr": makeRenderer(canvas.width, canvas.height),
+      "_ptr": ptr,
       _handle: handle,
       _canvas: canvas,
       _gl: gl,
@@ -98,6 +121,10 @@ Module["onRuntimeInitialized"] = function () {
     }
   };
 
+  // Null rather than a throw when the browser will not give out a context.
+  // Callers turn that into a blank widget and a warning: this runs inside
+  // frame callbacks and inside File.dispose, where a throw took down the
+  // app's own teardown rather than just the one widget that could not draw.
   Module["makeRenderer"] = function (canvas) {
     if (!_offscreenGL) {
       function MakeOffscreenGL(enableMSAA) {
@@ -106,10 +133,7 @@ Module["onRuntimeInitialized"] = function () {
         offscreenCanvas.height = 1;
         _offscreenGL = makeGLRenderer(offscreenCanvas, enableMSAA);
         if (!_offscreenGL) {
-          throw new Error(
-            "Rive: failed to create a WebGL2 context. WebGL2 may be " +
-              "unavailable or disabled in this environment.",
-          );
+          return null;
         }
 
         _offscreenGL._hasPixelLocalStorage = Boolean(
@@ -159,18 +183,31 @@ Module["onRuntimeInitialized"] = function () {
           _glCaps._enableAntialiasCanvas,
         );
         if (!_offscreenGL) {
-          throw new Error(
-            "Rive: failed to create a WebGL2 context. WebGL2 may be " +
-              "unavailable or disabled in this environment.",
+          console.warn(
+            "rive_native: WebGL2 is unavailable or disabled in this browser, " +
+              "so Rive content cannot render.",
           );
+          return null;
         }
         Object.assign(_offscreenGL, _glCaps);
       } else {
         _offscreenGL = MakeOffscreenGL(/*enableMSAA =*/ true);
+        if (!_offscreenGL) {
+          console.warn(
+            "rive_native: WebGL2 is unavailable or disabled in this browser, " +
+              "so Rive content cannot render.",
+          );
+          return null;
+        }
         if (!_offscreenGL._enableAntialiasCanvas) {
           // This browser prefers "antialias:false". Re-create the offscreen without MSAA.
           const msaaProbe = _offscreenGL;
           _offscreenGL = MakeOffscreenGL(/*enableMSAA =*/ false);
+          // Keep the MSAA one rather than ending up with none at all.
+          if (!_offscreenGL) {
+            _offscreenGL = msaaProbe;
+            return null;
+          }
           // Release the discarded probe (C++ renderer + WebGL context): an
           // idle context still occupies one of the browser's ~16 slots,
           // contributing to context-loss evictions elsewhere (including
@@ -189,10 +226,11 @@ Module["onRuntimeInitialized"] = function () {
       /*enableMSAA =*/ _offscreenGL._enableAntialiasCanvas,
     );
     if (!renderer) {
-      throw new Error(
-        "Rive: failed to create a WebGL2 context for a canvas — the " +
-          "browser's live WebGL context limit may be exhausted.",
+      console.warn(
+        "rive_native: the browser refused a WebGL2 context for a canvas; " +
+          "its live WebGL context limit is likely exhausted.",
       );
+      return null;
     }
     if (renderer) {
       // Extract the renderer-owned ore + PLS render context pointers.
@@ -212,24 +250,142 @@ Module["onRuntimeInitialized"] = function () {
     return renderer;
   };
 
+  // Hand the canvas to the shared replay worker and create the GL renderer
+  // there. Null when the worker entries are absent so Dart falls back inline.
+  Module["makeDeferredWorkerRenderer"] = function (canvas, sessionAddr) {
+    if (!Module["_riveDeferredWorkerTid"]) {
+      return null;
+    }
+    // The OffscreenCanvas inherits this size, so size before transferring.
+    const w = (canvas.clientWidth * (window.devicePixelRatio || 1)) | 0 || 1;
+    const h = (canvas.clientHeight * (window.devicePixelRatio || 1)) | 0 || 1;
+    canvas.width = w;
+    canvas.height = h;
+    const oc = canvas.transferControlToOffscreen();
+    const tid = Module["_riveDeferredWorkerTid"](); // starts the worker
+    // The canvas post waits in resolveWorkerPtr until the worker listener is
+    // up, so nothing races the spawn.
+    return {
+      _ptr: 0,
+      _ptrSlot: 0,
+      _sessionAddr: sessionAddr,
+      _canvas: canvas,
+      _oc: oc,
+      _tid: tid,
+      _w: w,
+      _h: h,
+      _deferredWorker: true,
+    };
+  };
+
+  // Posts the canvas with the create request once the worker is ready, both
+  // handled in one worker task. Returns 0 until the worker fills the slot.
+  function resolveWorkerPtr(renderer) {
+    if (renderer._ptr) {
+      return renderer._ptr;
+    }
+    if (!renderer._ptrSlot) {
+      if (!Module["_riveDeferredWorkerReady"]()) {
+        return 0;
+      }
+      const rec = PThread.pthreads[renderer._tid];
+      const w = rec && rec.worker ? rec.worker : rec;
+      if (!w) {
+        return 0;
+      }
+      const slot = Module["_malloc"](4);
+      Atomics.store(Module["heapViewU32"](slot, 1), 0, 0);
+      w.postMessage(
+        {
+          riveCanvas: 1,
+          id: renderer._canvas.id,
+          canvas: renderer._oc,
+          tid: renderer._tid,
+          session: renderer._sessionAddr,
+          w: renderer._w,
+          h: renderer._h,
+          slot: slot,
+        },
+        [renderer._oc],
+      );
+      renderer._ptrSlot = slot;
+      return 0;
+    }
+    const p = Atomics.load(Module["heapViewU32"](renderer._ptrSlot, 1), 0);
+    if (p === 0xffffffff) {
+      // The worker could not create the renderer; this is terminal.
+      renderer._workerFailed = true;
+      return 0;
+    }
+    if (p) {
+      renderer._ptr = p;
+      renderer._oreCtxPtr = Module["_rendererGetOreContext"](p);
+      renderer._renderCtxPtr = Module["_rendererGetGPURenderContext"](p);
+    }
+    return renderer._ptr || 0;
+  }
+
+  // False while the worker renderer is being created, recording then would
+  // pile paints into one illegal replayed frame. Also pumps the resolve along.
+  Module["deferredRendererReady"] = function (renderer) {
+    if (renderer._workerFailed) {
+      return -1; // terminal: creation failed, retrying cannot help
+    }
+    return !renderer._deferredWorker || resolveWorkerPtr(renderer) ? 1 : 0;
+  };
+
   const cppClear = Module["clearRenderer"];
   const cppResize = Module["resizeRenderer"];
+  const cppFlush = Module["flushRenderer"];
+
+  // A transferred canvas cannot transfer again, so re-attach reuses the worker
+  // renderer. False while it is still being created, the caller retries.
+  Module["redeferWorkerRenderer"] = function (renderer, sessionAddr) {
+    if (!renderer._ptrSlot) {
+      // Nothing posted yet, the eventual create carries the new session.
+      renderer._sessionAddr = sessionAddr;
+      return true;
+    }
+    const ptr = resolveWorkerPtr(renderer);
+    if (!ptr) {
+      return false;
+    }
+    Module["_riveDeferredWorkerRendererUseSession"](ptr, sessionAddr);
+    renderer._sessionAddr = sessionAddr;
+    return true;
+  };
+
+  // Gives the worker renderer and its GL context back. This is the only place
+  // they can be released: the renderer outlives any single session, so session
+  // teardown must leave it alone. False while the renderer is still being
+  // created — the caller keeps it and retires it later.
+  Module["deleteDeferredWorkerRenderer"] = function (renderer) {
+    if (!renderer || !renderer._deferredWorker) {
+      return false;
+    }
+    const ptr = resolveWorkerPtr(renderer);
+    if (!ptr) {
+      return false;
+    }
+    Module["_riveDeleteDeferredWorkerRenderer"](ptr);
+    renderer._ptr = 0;
+    renderer._ptrSlot = 0;
+    renderer._retired = true;
+    return true;
+  };
 
   // Track the active renderer so we know which GL context to restore after
   // ore operations that may have changed it.
   let _activeRenderer = null;
 
-  Module["clearRenderer"] = function (renderer, color) {
-    _activeRenderer = renderer;
-    GL.makeContextCurrent(renderer._handle);
-
+  // Backing policy is pushed onto the renderer by the Dart side
+  // (RenderResolution): an explicit physical size wins; otherwise size from
+  // the element's layout × devicePixelRatio × per-axis scales (which carry
+  // the ancestor paint scale under the display policy), capped at a logical
+  // max (aspect preserved). Everything is finally clamped to the GPU's
+  // render-target limit.
+  function backingSize(renderer) {
     const canvas = renderer._canvas;
-    // Backing policy is pushed onto the renderer by the Dart side
-    // (RenderResolution): an explicit physical size wins; otherwise size from
-    // the element's layout × devicePixelRatio × per-axis scales (which carry
-    // the ancestor paint scale under the display policy), capped at a logical
-    // max (aspect preserved). Everything is finally clamped to the GPU's
-    // render-target limit.
     let w, h;
     if (renderer._fixedWidth > 0 && renderer._fixedHeight > 0) {
       w = renderer._fixedWidth;
@@ -254,6 +410,30 @@ Module["onRuntimeInitialized"] = function () {
       w = Math.max(1, Math.floor(w * f));
       h = Math.max(1, Math.floor(h * f));
     }
+    return [w, h];
+  }
+
+  Module["clearRenderer"] = function (renderer, color) {
+    _activeRenderer = renderer;
+    if (renderer._deferredWorker) {
+      // The worker owns the GL context, nothing to make current here. Skip
+      // until the renderer is ready, the frame is dropped at flush.
+      const ptr = resolveWorkerPtr(renderer);
+      if (ptr) {
+        const [w, h] = backingSize(renderer);
+        if (w !== renderer._w || h !== renderer._h) {
+          renderer._w = w;
+          renderer._h = h;
+          Module["_resizeDeferredRendererOnWorker"](ptr, w, h);
+        }
+        cppClear(ptr, color);
+      }
+      return;
+    }
+    GL.makeContextCurrent(renderer._handle);
+
+    const canvas = renderer._canvas;
+    const [w, h] = backingSize(renderer);
     if (canvas.width != w || canvas.height != h) {
       canvas.width = w;
       canvas.height = h;
@@ -262,12 +442,31 @@ Module["onRuntimeInitialized"] = function () {
     cppClear(renderer["_ptr"], color);
   };
 
+  // Flush takes the renderer object (immediate or deferred worker).
+  Module["flushRenderer"] = function (renderer) {
+    if (renderer._deferredWorker) {
+      const ptr = resolveWorkerPtr(renderer);
+      if (!ptr) {
+        // Unreachable when the producer gates on deferredRendererReady. No
+        // reset, the stream is stateful and creates must replay in order.
+        if (!renderer._warnedNotReady) {
+          renderer._warnedNotReady = true;
+          console.warn(
+            "rive_native: flush before worker renderer ready; " +
+              "gate frames on canAcceptDeferredFrame",
+          );
+        }
+        return;
+      }
+      cppFlush(ptr);
+      return;
+    }
+    cppFlush(renderer["_ptr"]);
+  };
+
   Module["stringViewU8"] = function (start) {
-    var wasmMemory = Module["wasmMemory"];
-    var buffer = wasmMemory ? wasmMemory["buffer"] : Module["HEAPU8"]["buffer"];
-    var data = wasmMemory
-      ? new Uint8Array(buffer, buffer.byteOffset, buffer.byteLength)
-      : Module["HEAPU8"];
+    var buffer = heapBuffer();
+    var data = new Uint8Array(buffer, buffer.byteOffset, buffer.byteLength);
     var current = start;
     while (data[current] != 0 && current < buffer.byteLength) {
       current++;
@@ -361,8 +560,8 @@ Module["onRuntimeInitialized"] = function () {
   };
 
   var nativeBreakLines = Module["breakLines"];
-  Module["breakLines"] = function (shape, width, align, wrap) {
-    var breakResult = nativeBreakLines(shape, width, align, wrap);
+  Module["breakLines"] = function (shape, width, align, wrap, wordBreak) {
+    var breakResult = nativeBreakLines(shape, width, align, wrap, wordBreak);
     return {
       "rawResult": breakResult,
       "results": Module["heapViewU8"](breakResult),
@@ -390,51 +589,27 @@ Module["onRuntimeInitialized"] = function () {
   };
 
   Module["heap"] = function (start, length) {
-    var wasmMemory = Module["wasmMemory"];
-    if (!wasmMemory) {
-      return Module["HEAPU8"]["buffer"];
-    }
-    return wasmMemory["buffer"];
+    return heapBuffer();
   };
 
   Module["heapViewU8"] = function (start, length) {
-    var wasmMemory = Module["wasmMemory"];
-    if (!wasmMemory) {
-      return new Uint8Array(Module["HEAPU8"]["buffer"], start, length);
-    }
-    return new Uint8Array(wasmMemory["buffer"], start, length);
+    return new Uint8Array(heapBuffer(), start, length);
   };
 
   Module["heapViewU16"] = function (start, length) {
-    var wasmMemory = Module["wasmMemory"];
-    if (!wasmMemory) {
-      return new Uint16Array(Module["HEAPU8"]["buffer"], start, length);
-    }
-    return new Uint16Array(wasmMemory["buffer"], start, length);
+    return new Uint16Array(heapBuffer(), start, length);
   };
 
   Module["heapViewU32"] = function (start, length) {
-    var wasmMemory = Module["wasmMemory"];
-    if (!wasmMemory) {
-      return new Uint32Array(Module["HEAPU8"]["buffer"], start, length);
-    }
-    return new Uint32Array(wasmMemory["buffer"], start, length);
+    return new Uint32Array(heapBuffer(), start, length);
   };
 
   Module["heapViewF32"] = function (start, length) {
-    var wasmMemory = Module["wasmMemory"];
-    if (!wasmMemory) {
-      return new Float32Array(Module["HEAPF32"]["buffer"], start, length);
-    }
-    return new Float32Array(wasmMemory["buffer"], start, length);
+    return new Float32Array(heapBuffer(), start, length);
   };
 
   Module["heapDataView"] = function (start, length) {
-    var wasmMemory = Module["wasmMemory"];
-    if (!wasmMemory) {
-      return new DataView(Module["HEAPU8"]["buffer"], start, length);
-    }
-    return new DataView(wasmMemory["buffer"], start, length);
+    return new DataView(heapBuffer(), start, length);
   };
 
   var scriptingWorkspaceResponse = Module["scriptingWorkspaceResponse"];

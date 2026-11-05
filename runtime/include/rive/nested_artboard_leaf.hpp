@@ -7,8 +7,10 @@ namespace rive
 class NestedArtboardLeaf : public NestedArtboardLeafBase
 {
 public:
-    Core* clone() const override;
-    void update(ComponentDirt value) override;
+  Core* clone() const override;
+  void update(ComponentDirt value) override;
+  void fitChanged() override { markWorldTransformDirty(); }
+  void fitToLayoutParentChanged() override { markWorldTransformDirty(); }
 };
 } // namespace rive
 

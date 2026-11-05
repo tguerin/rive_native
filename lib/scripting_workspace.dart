@@ -15,7 +15,7 @@ import 'package:rive_native/utilities.dart';
 /// been closed or is in the process of closing.
 class ScriptingWorkspaceClosedError extends StateError {
   ScriptingWorkspaceClosedError()
-    : super('Cannot request work on a closed ScriptingWorkspace');
+      : super('Cannot request work on a closed ScriptingWorkspace');
 }
 
 enum HighlightScope {
@@ -203,6 +203,16 @@ enum ScriptProblemType {
   wgslValidationError,
 
   requireQualification,
+
+  fileFormatError,
+  fileFormatWarning,
+
+  staticRequire,
+
+  shaderVariantWarning,
+
+  asError,
+  asWarning,
 }
 
 class ScriptProblemResult {
@@ -258,33 +268,70 @@ class ScriptProblemResult {
   }
 }
 
+/// Which analyzer produced a problem. Mirrors the workspace's ProblemSource;
+/// named Tool because the editor already has a ScriptProblemSource class.
+enum ScriptProblemTool { luau, wgslAnalyzer, naga, rasc, document, internal }
+
+/// Per-record severity. The report's buckets only split errors from
+/// warnings; hints need their own value. Mirrors ProblemSeverity.
+enum ScriptProblemSeverity { error, warning, hint }
+
 class ScriptProblem {
   final ScriptRange range;
   final String message;
   final ScriptProblemType type;
+  final ScriptProblemSeverity severity;
+  final ScriptProblemTool source;
+
+  /// Tool-native code like rasc's W1008; empty when the tool has none.
+  final String code;
 
   ScriptProblem({
     required this.range,
     required this.message,
     required this.type,
+    this.severity = ScriptProblemSeverity.error,
+    this.source = ScriptProblemTool.luau,
+    this.code = '',
   });
 
-  @override
-  String toString() => 'ScriptProblem($type:$range) - $message';
+  /// Message with the tool's code ahead of it, the way rasc used to bake it
+  /// into the text.
+  String get displayMessage => code.isEmpty ? message : '$code: $message';
 
   @override
-  int get hashCode => Object.hash(range, message, type);
+  String toString() => 'ScriptProblem($type:$range) - $displayMessage';
+
+  @override
+  int get hashCode => Object.hash(range, message, type, severity, source, code);
 
   @override
   bool operator ==(Object other) =>
       other is ScriptProblem &&
       other.type == type &&
       other.range == range &&
-      other.message == message;
+      other.message == message &&
+      other.severity == severity &&
+      other.source == source &&
+      other.code == code;
 
   static ScriptProblem read(BinaryReader reader) {
+    final typeValue = reader.readUint8();
+    final type = typeValue < ScriptProblemType.values.length
+        ? ScriptProblemType.values[typeValue]
+        : ScriptProblemType.unknown;
+    final severityValue = reader.readUint8();
+    final sourceValue = reader.readUint8();
+    final code = reader.readString();
     return ScriptProblem(
-      type: ScriptProblemType.values[reader.readUint8()],
+      type: type,
+      severity: severityValue < ScriptProblemSeverity.values.length
+          ? ScriptProblemSeverity.values[severityValue]
+          : ScriptProblemSeverity.error,
+      source: sourceValue < ScriptProblemTool.values.length
+          ? ScriptProblemTool.values[sourceValue]
+          : ScriptProblemTool.luau,
+      code: code,
       range: ScriptRange.read(reader),
       message: reader.readString(),
     );
@@ -484,11 +531,27 @@ class ImplementedTypeProperty {
   /// artboard.
   final String typeName;
 
+  /// The literal an AnimaScript input is declared with, typed as the value
+  /// the input holds; null when the script declares none.
+  Object? defaultValue;
+
   ImplementedTypeProperty({
     required this.type,
     required this.typeName,
     required this.name,
   });
+
+  void readDefault(BinaryReader reader) {
+    if (reader.readUint8() == 0) {
+      return;
+    }
+    defaultValue = switch (type) {
+      PropertyType.string => reader.readString(),
+      PropertyType.boolean => reader.readFloat64() != 0,
+      PropertyType.color => reader.readFloat64().toInt(),
+      _ => reader.readFloat64(),
+    };
+  }
 
   static ImplementedTypeProperty? read(BinaryReader reader) {
     if (reader.isEOF) {
@@ -515,21 +578,72 @@ class ImplementedTypeProperty {
   }
 }
 
+/// One exported protocol class of an AnimaScript script that exports
+/// several; each routes as `script#Class`.
+class ImplementedProtocolClass {
+  final String name;
+  final String protocol;
+  final List<String> implementedMethods;
+  final List<ImplementedTypeProperty> inputs;
+
+  ImplementedProtocolClass({
+    required this.name,
+    required this.protocol,
+    required this.implementedMethods,
+    required this.inputs,
+  });
+
+  static ImplementedProtocolClass? read(BinaryReader reader) {
+    final name = reader.readString();
+    final protocol = reader.readString();
+    final methods = <String>[];
+    final methodCount = reader.readVarUint();
+    for (int i = 0; i < methodCount; i++) {
+      methods.add(reader.readString());
+    }
+    final inputs = <ImplementedTypeProperty>[];
+    final inputCount = reader.readVarUint();
+    for (int i = 0; i < inputCount; i++) {
+      final input = ImplementedTypeProperty.read(reader);
+      if (input == null) {
+        return null;
+      }
+      inputs.add(input);
+    }
+    return ImplementedProtocolClass(
+      name: name,
+      protocol: protocol,
+      implementedMethods: methods,
+      inputs: inputs,
+    );
+  }
+}
+
 class ImplementedType {
   final String scriptName;
   final String interfaceTypeName;
   final List<ImplementedTypeProperty> inputs;
   final List<ImplementedTypeProperty> outputs;
+  /// Every exported protocol class; the first is the one the script asset
+  /// binds, see [routedTo].
   final List<String> userTypeNames;
+  /// Each class of a script that exports several, with its own protocol.
+  final List<ImplementedProtocolClass> protocolClasses;
 
   /// Direct dependencies (requires) for this module.
   final List<String> dependencies;
 
-  /// Optional script methods (init/draw/drawCanvas/advance/...) present on the
+  /// Optional script methods (init/draw/advance/...) present on the
   /// generator's returned table, detected by the workspace executing the
   /// generator and probing the returned table. Empty if the generator could
   /// not be executed.
   final List<String> implementedMethods;
+
+  /// FileFormat protocol scripts only: display name and claimed file
+  /// extensions read from the generator's returned table. Empty otherwise.
+  final String formatName;
+  final List<String> formatExtensions;
+
   ImplementedType({
     required this.scriptName,
     required this.interfaceTypeName,
@@ -538,7 +652,41 @@ class ImplementedType {
     required this.userTypeNames,
     required this.dependencies,
     required this.implementedMethods,
+    this.formatName = '',
+    this.formatExtensions = const [],
+    this.protocolClasses = const [],
   });
+
+  /// A script exporting several classes bound to the one whose protocol is
+  /// [interfaceTypeName]: that class comes first and the report carries its
+  /// protocol, hooks and inputs. Without a match the first class stays.
+  ImplementedType routedTo(String? interfaceTypeName) {
+    if (protocolClasses.length < 2) {
+      return this;
+    }
+    var chosen = protocolClasses.first;
+    for (final cls in protocolClasses) {
+      if (cls.protocol == interfaceTypeName) {
+        chosen = cls;
+        break;
+      }
+    }
+    return ImplementedType(
+      scriptName: scriptName,
+      interfaceTypeName: chosen.protocol,
+      inputs: chosen.inputs,
+      outputs: outputs,
+      userTypeNames: [
+        chosen.name,
+        ...userTypeNames.where((name) => name != chosen.name),
+      ],
+      dependencies: dependencies,
+      implementedMethods: chosen.implementedMethods,
+      formatName: formatName,
+      formatExtensions: formatExtensions,
+      protocolClasses: protocolClasses,
+    );
+  }
 
   static ImplementedType? read(BinaryReader reader) {
     if (reader.isEOF) {
@@ -603,6 +751,45 @@ class ImplementedType {
       }
     }
 
+    // FileFormat metadata, appended after methods with a presence marker.
+    var formatName = '';
+    final formatExtensions = <String>[];
+    if (!reader.isEOF && reader.readUint8() != 0) {
+      formatName = reader.readString();
+      final extensionCount = reader.readVarUint();
+      for (int i = 0; i < extensionCount; i++) {
+        formatExtensions.add(reader.readString());
+      }
+    }
+
+    // Per class detail, for AnimaScript scripts exporting several.
+    final protocolClasses = <ImplementedProtocolClass>[];
+    var classesRead = true;
+    if (!reader.isEOF) {
+      final classCount = reader.readVarUint();
+      for (int i = 0; i < classCount; i++) {
+        final cls = ImplementedProtocolClass.read(reader);
+        if (cls == null) {
+          classesRead = false;
+          break;
+        }
+        protocolClasses.add(cls);
+      }
+    }
+
+    // Declared defaults, in the order the inputs were read. After a class
+    // that failed to parse the reader is not at them.
+    if (classesRead && !reader.isEOF) {
+      for (final input in inputs) {
+        input.readDefault(reader);
+      }
+      for (final cls in protocolClasses) {
+        for (final input in cls.inputs) {
+          input.readDefault(reader);
+        }
+      }
+    }
+
     return ImplementedType(
       scriptName: scriptName,
       interfaceTypeName: interfaceName,
@@ -611,6 +798,9 @@ class ImplementedType {
       userTypeNames: userTypesNames,
       dependencies: dependencies,
       implementedMethods: implementedMethods,
+      formatName: formatName,
+      formatExtensions: formatExtensions,
+      protocolClasses: protocolClasses,
     );
   }
 }
@@ -641,6 +831,11 @@ class ShaderCompileError {
   @override
   String toString() => '$scriptName: $message';
 }
+
+/// The module entry a signing result carries when its scripts include
+/// AnimaScript: the wasm module they baked into, written to the runtime
+/// file as the ScriptModuleAsset of that name.
+const String wasmModuleAsScriptName = 'scripts_as';
 
 class CompileAndSignResult {
   final List<CompiledModule> modules;
@@ -863,6 +1058,134 @@ class VMResult {
   }
 }
 
+/// One note from the Luau to AnimaScript translator, anchored to the Luau
+/// source; fatal ones stop the translation.
+class AsTranslationNote {
+  final int line;
+  final int column;
+  final bool fatal;
+  final String message;
+  AsTranslationNote({
+    required this.line,
+    required this.column,
+    required this.fatal,
+    required this.message,
+  });
+}
+
+/// Result of [ScriptingWorkspace.requestTranslateToAs].
+class AsTranslation {
+  final bool ok;
+  final String source;
+  final List<AsTranslationNote> notes;
+  AsTranslation({required this.ok, required this.source, required this.notes});
+
+  /// Why the translation stopped, when it did.
+  String? get fatalMessage {
+    for (final note in notes) {
+      if (note.fatal) {
+        return note.message;
+      }
+    }
+    return null;
+  }
+
+  static AsTranslation? read(BinaryReader reader) {
+    if (reader.isEOF) {
+      return null;
+    }
+    final ok = reader.readUint8() != 0;
+    final source = reader.readString();
+    final notes = <AsTranslationNote>[];
+    final count = reader.readVarUint();
+    for (int i = 0; i < count; i++) {
+      final line = reader.readVarUint();
+      final column = reader.readVarUint();
+      final fatal = reader.readUint8() != 0;
+      notes.add(AsTranslationNote(
+        line: line,
+        column: column,
+        fatal: fatal,
+        message: reader.readString(),
+      ));
+    }
+    return AsTranslation(ok: ok, source: source, notes: notes);
+  }
+}
+
+/// Whether a bake left an -O3 artifact for the VM booted from it, or why
+/// that VM runs on the interpreter instead.
+enum WasmAotStatus {
+  ready,
+
+  /// No AOT compiling on this platform, Windows and the web for now.
+  unsupported,
+  noCompiler,
+  compilerUnusable,
+  compilerUnpatched,
+  compileFailed,
+
+  /// Other users can write the AOT cache, so it is never read.
+  cacheNotPrivate,
+}
+
+/// Result of [ScriptingWorkspace.requestCompileWasmAs]: the module every
+/// AnimaScript source baked into, or the compile error.
+class WasmModuleResult {
+  final Uint8List module;
+  final String error;
+
+  /// Compiled WGSL by registered module name, for the VM the module boots on.
+  final Map<String, Uint8List> shaders;
+
+  /// Null when the bake asked for no artifact.
+  final WasmAotStatus? aotStatus;
+
+  /// The compiler the status is about, when it names one.
+  final String aotDetail;
+  WasmModuleResult({
+    required this.module,
+    required this.error,
+    this.shaders = const {},
+    this.aotStatus,
+    this.aotDetail = '',
+  });
+  bool get ok => error.isEmpty && module.isNotEmpty;
+
+  static WasmModuleResult? read(BinaryReader reader) {
+    if (reader.isEOF) {
+      return null;
+    }
+    final error = reader.readString();
+    if (reader.isEOF) {
+      return WasmModuleResult(module: Uint8List(0), error: error);
+    }
+    final length = reader.readVarUint();
+    final module = reader.read(length);
+    final shaders = <String, Uint8List>{};
+    if (!reader.isEOF) {
+      final count = reader.readVarUint();
+      for (var i = 0; i < count; i++) {
+        final name = reader.readString();
+        shaders[name] = reader.read(reader.readVarUint());
+      }
+    }
+    WasmAotStatus? aotStatus;
+    var aotDetail = '';
+    if (!reader.isEOF) {
+      aotStatus = WasmAotStatus.values[reader.readVarUint()];
+      aotDetail = reader.readString();
+    }
+    return WasmModuleResult(
+      module: module,
+      error: error,
+      shaders: shaders,
+      aotStatus: aotStatus,
+      aotDetail: aotDetail,
+    );
+  }
+}
+
 class CompileResult {
   final Uint8List bytecode;
   final Iterable<CompiledModule> dependencies;
@@ -923,6 +1246,16 @@ enum DebugLevel {
 
   /// full debug info with local & upvalue names; necessary for debugger
   max,
+}
+
+/// Which WebAssembly SIMD an AnimaScript bake may emit. The order is the
+/// Backboard's wasmSimd values.
+enum WasmSimd {
+  off,
+  on,
+
+  /// Fused multiply-add whose results can differ by platform.
+  relaxed,
 }
 
 /// A workspace represents a collection of files that are likely related
@@ -992,6 +1325,20 @@ abstract class ScriptingWorkspace {
     bool highlight = false,
   });
 
+  /// Set a custom format document source. Same as [setScriptSource] but marks
+  /// the script as a document handled by the FileFormat protocol script with
+  /// [formatScriptId]. Highlight, problems, autocomplete, hover, and format
+  /// requests dispatch to that handler inside the workspace. An empty
+  /// [formatScriptId] registers the document with no intelligence.
+  Future<HighlightResult> setDocumentSource(
+    String scriptId,
+    String scriptName,
+    String source, {
+    required String formatScriptId,
+    required String formatExtension,
+    bool highlight = false,
+  });
+
   /// Set the diff source for a module with [scriptId]. We store the diff source
   /// on the Script so subsequent calls to setScriptSource can return line
   /// level diffs with stored source when requesting highlighting data.
@@ -1045,6 +1392,10 @@ abstract class ScriptingWorkspace {
 
   /// Get the highlight data for a single row of [scriptName].
   Uint32List rowHighlight(String scriptName, int row);
+
+  /// Cached FileFormat parse artifact for a document (produced by the
+  /// handler's parse), or null when none exists.
+  Uint8List? formatParseData(String docId);
 
   /// Get an error report for all the script files in this workspace.
   Future<List<ScriptProblemResult>> fullProblemReport();
@@ -1110,8 +1461,66 @@ abstract class ScriptingWorkspace {
   /// registered module list.
   Future<VMResult?> requestVM({int factoryPointer = 0});
 
-  static ScriptingWorkspace make({bool canvasEnabled = false}) =>
-      makeScriptingWorkspace(canvasEnabled: canvasEnabled);
+  /// Bakes every AnimaScript source into one wasm module against the
+  /// std tree from [setRascStdDir]; protocol classes register under their
+  /// workspace script id, with the file's [simd] so previews match exports.
+  /// A preview carries line probes, fuel, its shaders and an AOT artifact.
+  /// [forExport] ships the module alone, with [debugProbes] deciding its
+  /// probes and throw messages and [fuel] metering it so browsers can bound it.
+  Future<WasmModuleResult?> requestCompileWasmAs({
+    WasmSimd simd = WasmSimd.on,
+    bool forExport = false,
+    bool debugProbes = true,
+    bool fuel = false,
+  });
+
+  /// The file's [simd], so AnimaScript diagnostics fold what a bake would
+  /// before one runs. Push it before the first report and on each change.
+  void setAsBakeOptions({WasmSimd simd = WasmSimd.on});
+
+  /// rasc's std tree, which AnimaScript diagnostics resolve imports
+  /// against. Must be set before the first problem report.
+  void setRascStdDir(String dir);
+
+  /// Points AnimaScript at the std tree the native library carries, for a
+  /// host with no checkout to read. False when the library carries none.
+  bool setBundledRascStd();
+
+  /// A std tree on disk wins, so a std edit lands without a native rebuild;
+  /// without one, the library's own copy. False when neither is there.
+  bool useRascStd(String? dir) {
+    if (dir == null) {
+      return setBundledRascStd();
+    }
+    setRascStdDir(dir);
+    return true;
+  }
+
+  /// Translates the Luau script [scriptId] to AnimaScript over the rive
+  /// std library; the source carries a header listing every site the
+  /// translator could not type or express.
+  Future<AsTranslation?> requestTranslateToAs(String scriptId);
+
+  /// Sets an AnimaScript source; the AS pool serves its highlight,
+  /// diagnostics, completion and bake.
+  Future<HighlightResult> setAnimaScriptSource(
+    String scriptId,
+    String scriptName,
+    String source, {
+    bool highlight = false,
+  });
+
+  /// [canvasEnabled] types the GPU canvas APIs; [netEnabled] types fetch(),
+  /// context:decodeFile and bindable artboards, which only a runtime built
+  /// with script networking has (otherwise they stay untyped).
+  static ScriptingWorkspace make({
+    bool canvasEnabled = false,
+    bool netEnabled = false,
+  }) =>
+      makeScriptingWorkspace(
+        canvasEnabled: canvasEnabled,
+        netEnabled: netEnabled,
+      );
 
   /// Initialises GPU scripting for the current platform. Call once after the
   /// native renderer is set up (i.e. after [RiveNative.init] completes).
@@ -1171,6 +1580,10 @@ abstract class ScriptingWorkspace {
       _completeImplementedType(completer, response);
     } else if (completer is Completer<VMResult?>) {
       _completeRequestVM(completer, response);
+    } else if (completer is Completer<WasmModuleResult?>) {
+      _completeCompileWasmAs(completer, response);
+    } else if (completer is Completer<AsTranslation?>) {
+      _completeTranslateToAs(completer, response);
     } else if (completer is Completer<CompileResult?>) {
       _completeCompile(completer, response);
     } else if (completer is Completer<CompileAndSignResult?>) {
@@ -1314,6 +1727,30 @@ abstract class ScriptingWorkspace {
       return;
     }
     completer.complete(CompileResult.read(reader));
+  }
+
+  void _completeTranslateToAs(
+    Completer<AsTranslation?> completer,
+    ScriptingWorkspaceResponseResult result,
+  ) {
+    final reader = result.reader;
+    if (reader == null || reader.isEOF) {
+      completer.complete(null);
+      return;
+    }
+    completer.complete(AsTranslation.read(reader));
+  }
+
+  void _completeCompileWasmAs(
+    Completer<WasmModuleResult?> completer,
+    ScriptingWorkspaceResponseResult result,
+  ) {
+    final reader = result.reader;
+    if (reader == null || reader.isEOF) {
+      completer.complete(null);
+      return;
+    }
+    completer.complete(WasmModuleResult.read(reader));
   }
 
   void _completeCompileAndSign(

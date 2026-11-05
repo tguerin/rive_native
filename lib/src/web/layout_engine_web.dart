@@ -80,6 +80,16 @@ late js.JSFunction _yogaNodeGetType;
 late js.JSFunction _yogaNodeSetType;
 late js.JSFunction _yogaNodeCheckAndResetUpdated;
 late js.JSFunction _yogaNodeHasError;
+// Nullable, unlike the rest: these are read back with a tolerant lookup so an
+// older rive_native.wasm without them still boots. See _readGridLineOffsets.
+js.JSFunction? _yogaNodeGetGridColumnLineCount;
+js.JSFunction? _yogaNodeGetGridColumnLineOffset;
+js.JSFunction? _yogaNodeGetGridRowLineCount;
+js.JSFunction? _yogaNodeGetGridRowLineOffset;
+js.JSFunction? _yogaNodeSetGridVirtualContributions;
+js.JSFunction? _yogaNodeGetGridLineOffsets;
+js.JSFunction? _yogaNodeGetGridGap;
+bool _warnedNoGridContributions = false;
 
 // ignore: avoid_classes_with_only_static_members
 class LayoutEngineWasm {
@@ -178,6 +188,19 @@ class LayoutEngineWasm {
     _yogaNodeClearBaselineFunc =
         module['yogaNodeClearBaselineFunc'] as js.JSFunction;
     _yogaNodeMarkDirty = module['_yogaNodeMarkDirty'] as js.JSFunction;
+    _yogaNodeGetGridColumnLineCount =
+        module['_yogaNodeGetGridColumnLineCount'] as js.JSFunction?;
+    _yogaNodeGetGridColumnLineOffset =
+        module['_yogaNodeGetGridColumnLineOffset'] as js.JSFunction?;
+    _yogaNodeGetGridRowLineCount =
+        module['_yogaNodeGetGridRowLineCount'] as js.JSFunction?;
+    _yogaNodeGetGridRowLineOffset =
+        module['_yogaNodeGetGridRowLineOffset'] as js.JSFunction?;
+    _yogaNodeSetGridVirtualContributions =
+        module['yogaNodeSetGridVirtualContributions'] as js.JSFunction?;
+    _yogaNodeGetGridLineOffsets =
+        module['yogaNodeGetGridLineOffsets'] as js.JSFunction?;
+    _yogaNodeGetGridGap = module['_yogaNodeGetGridGap'] as js.JSFunction?;
     _yogaNodeInsertChild = module['_yogaNodeInsertChild'] as js.JSFunction;
     _yogaNodeRemoveChild = module['_yogaNodeRemoveChild'] as js.JSFunction;
     _yogaNodeClearChildren = module['_yogaNodeClearChildren'] as js.JSFunction;
@@ -709,13 +732,85 @@ class LayoutNodeWasm extends LayoutNode {
     );
   }
 
-  // Grid line offsets are not surfaced to the web/WASM binding — grid drag
-  // tooling that reads them is desktop-only.
   @override
-  List<double> get gridColumnLineOffsets => const [];
+  List<double> get gridColumnLineOffsets => _readGridLineOffsets(false,
+      _yogaNodeGetGridColumnLineCount, _yogaNodeGetGridColumnLineOffset);
 
   @override
-  List<double> get gridRowLineOffsets => const [];
+  List<double> get gridRowLineOffsets => _readGridLineOffsets(
+      true, _yogaNodeGetGridRowLineCount, _yogaNodeGetGridRowLineOffset);
+
+  @override
+  double get gridColumnGap => _readGridGap(false);
+
+  @override
+  double get gridRowGap => _readGridGap(true);
+
+  double _readGridGap(bool rows) {
+    final gap = _yogaNodeGetGridGap;
+    if (gap == null) {
+      return 0;
+    }
+    return (gap.callAsFunction(null, _nativePtr.toJS, rows.toJS)
+            as js.JSNumber)
+        .toDartDouble;
+  }
+
+  @override
+  bool setGridVirtualContributions(List<double> rows, List<double> columns) {
+    final set = _yogaNodeSetGridVirtualContributions;
+    if (set == null) {
+      if (!_warnedNoGridContributions) {
+        _warnedNoGridContributions = true;
+        debugPrint('rive_native.wasm predates grid virtual contributions: '
+            'virtualized grids size from their realized items only.');
+      }
+      return false;
+    }
+    return (set.callAsFunction(
+      null,
+      _nativePtr.toJS,
+      Float32List.fromList(rows).toJS,
+      Float32List.fromList(columns).toJS,
+    ) as js.JSBoolean)
+        .toDart;
+  }
+
+  /// Reads a resolved grid line list one offset at a time, mirroring the FFI
+  /// binding — the count and the accessor are separate exports, so there's no
+  /// buffer to marshal.
+  ///
+  /// Empty when the module predates these exports, rather than throwing: the
+  /// wasm is a separately built artifact, and a hard cast at startup would
+  /// stop the whole app booting against an older one.
+  List<double> _readGridLineOffsets(
+      bool rows, js.JSFunction? count, js.JSFunction? offset) {
+    // One copy for every line where the module has it: a virtualized grid
+    // has one per row.
+    final bulk = _yogaNodeGetGridLineOffsets;
+    if (bulk != null) {
+      return List<double>.of(
+          (bulk.callAsFunction(null, _nativePtr.toJS, rows.toJS)
+                  as js.JSFloat32Array)
+              .toDart,
+          growable: false);
+    }
+    if (count == null || offset == null) {
+      return const [];
+    }
+    final lines =
+        (count.callAsFunction(null, _nativePtr.toJS) as js.JSNumber).toDartInt;
+    if (lines == 0) {
+      return const [];
+    }
+    return List<double>.generate(
+      lines,
+      (i) => (offset.callAsFunction(null, _nativePtr.toJS, i.toJS)
+              as js.JSNumber)
+          .toDartDouble,
+      growable: false,
+    );
+  }
 
   @override
   void clearChildren() => _yogaNodeClearChildren.callAsFunction(

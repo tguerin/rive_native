@@ -25,7 +25,6 @@ import 'package:rive_native/semantics.dart';
 ///   }
 /// }
 /// ```
-@experimental
 @internal
 base mixin RiveSemanticsMixin on rive.RivePainter {
   /// The state machine to query for semantic diffs.
@@ -67,6 +66,11 @@ base mixin RiveSemanticsMixin on rive.RivePainter {
       tree.applyDiff(diff);
     }
   }
+
+  /// Clear the semantic tree. Call whenever [semanticsStateMachine] is
+  /// replaced: node ids restart at 1 per state machine, so stale nodes from
+  /// the previous machine would collide with the new machine's diff stream.
+  void resetSemanticTree() => _semanticTree?.clear();
 
   /// Dispose the semantic tree. Call from your painter's `dispose` method.
   void disposeSemantics() {

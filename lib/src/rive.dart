@@ -1,13 +1,16 @@
 import 'dart:async';
 import 'dart:typed_data';
-import 'dart:ui' show Color, VoidCallback;
+import 'dart:ui' show BlendMode, Color, VoidCallback;
 
+import 'package:flutter/foundation.dart' show debugPrint, kDebugMode;
 import 'package:flutter/services.dart'
-    show AssetBundle, LogicalKeyboardKey, rootBundle;
+    show AssetBundle, HardwareKeyboard, LogicalKeyboardKey, rootBundle;
+import 'package:flutter/widgets.dart' show WidgetsFlutterBinding;
 import 'package:http/http.dart' as http;
 import 'package:meta/meta.dart';
 import 'package:rive_native/focus.dart' as focus;
 import 'package:rive_native/rive_luau.dart';
+import 'package:rive_native/rive_wasm_scripting.dart' show WasmScriptingVM;
 import 'package:rive_native/semantics.dart';
 
 import '../rive_native.dart';
@@ -23,29 +26,6 @@ const _useDataBindingDeprecationMessageSMInput =
 @internal
 typedef ViewModelInstanceCreateCallback = void Function(
     InternalViewModelInstance, Uint8List);
-
-class Rive {
-  /// Advances multiple state machines in a single batch operation.
-  ///
-  /// More efficient than advancing each state machine individually when
-  /// rendering multiple Rive animations.
-  ///
-  /// WARNING: Not supported on the web
-  static void batchAdvance(
-          Iterable<StateMachine> stateMachines, double elapsedSeconds) =>
-      batchAdvanceStateMachines(stateMachines, elapsedSeconds);
-
-  /// Advances and renders multiple state machines in a single batch operation.
-  ///
-  /// Combines advancing and rendering for better performance when displaying
-  /// multiple Rive animations simultaneously.
-  ///
-  /// WARNING: Not supported on the web
-  static void batchAdvanceAndRender(Iterable<StateMachine> stateMachines,
-          double elapsedSeconds, Renderer renderer) =>
-      batchAdvanceAndRenderStateMachines(
-          stateMachines, elapsedSeconds, renderer);
-}
 
 /// Factory for creating Rive rendering objects.
 ///
@@ -73,7 +53,9 @@ abstract class Factory {
   /// Returns the Flutter-based factory using Skia/Impeller for rendering.
   static Factory get flutter => getFlutterFactory();
 
-  /// Returns the Rive factory (recommended).
+  /// Returns the Rive factory (recommended). Under deferred rendering (the
+  /// default on native) this is the render context's recording session, so
+  /// resources made here record into the stream every texture replays.
   static Factory get rive {
     return getRiveFactory();
   }
@@ -92,6 +74,10 @@ abstract class Factory {
 
   /* INTERNAL */
 
+  /// Called right before a file's synchronous native load.
+  @internal
+  void startedDecodingFile() {}
+
   @internal
   Future<void> completedDecodingFile(bool success);
 
@@ -100,6 +86,9 @@ abstract class Factory {
 
   @internal
   IndexRenderBuffer? makeIndexBuffer(int elementCount);
+
+  @internal
+  ImageMeshInstances makeImageMeshInstances(int count);
 }
 
 /// Extension providing convenience accessors for [FileAsset] properties.
@@ -193,11 +182,49 @@ abstract class AudioAsset extends FileAsset {
 /// An unrecognized asset type in a Rive file.
 abstract class UnknownAsset extends FileAsset {}
 
+/// Calls [File.frameBoundary] on every live file once a frame, after the
+/// frame has advanced and drawn everything.
+abstract final class _FrameBoundaries {
+  // Weak so a file nobody disposes still finalizes.
+  static final _files = <WeakReference<File>>[];
+  static bool _scheduled = false;
+
+  static void track(File file) {
+    _files.add(WeakReference(file));
+    if (_scheduled) {
+      return;
+    }
+    _scheduled = true;
+    final binding = WidgetsFlutterBinding.ensureInitialized();
+    binding.addPersistentFrameCallback((_) {
+      if (_files.isNotEmpty) {
+        binding.addPostFrameCallback(_service);
+      }
+    });
+  }
+
+  static void _service(Duration _) {
+    _files.removeWhere((file) => file.target == null);
+    for (final file in _files) {
+      final warning = file.target?.frameBoundary();
+      if (warning != null && kDebugMode) {
+        debugPrint(warning);
+      }
+    }
+  }
+}
+
 /// A loaded Rive file containing artboards, animations, and view models.
 ///
 /// Use the static methods [File.asset], [File.url], [File.path], or
 /// [File.decode] to load a Rive file.
 abstract class File {
+  /// Every file has its wasm scripts serviced at the end of each frame, so
+  /// hosts never call [frameBoundary] themselves.
+  File() {
+    _FrameBoundaries.track(this);
+  }
+
   /// Releases all resources associated with this file.
   ///
   /// Call this when you're done using the file to free memory.
@@ -220,6 +247,25 @@ abstract class File {
   /// Set [frameOrigin] to `false` to position the artboard at its original
   /// coordinates rather than centering it at (0, 0).
   Artboard? artboardAt(int index, {bool frameOrigin = true});
+
+  /// The artboard at [index] instanced as a paint source (an artboard a shape
+  /// is filled with), or `null` if out of bounds or unsupported here.
+  ArtboardPaintSource? artboardPaintSource(int index) => null;
+
+  /// Byte extent of the artboard at [index] within the stream this file was
+  /// imported from, relative to the end of the header, as `[start, end)`.
+  /// Returns `[0, 0]` when unknown. Used to check that an exporter's recorded
+  /// artboard ranges agree with what the runtime read.
+  List<int> artboardByteRange(int index);
+
+  /// Re-imports the artboard at [index] from [bytes] -- that artboard's own
+  /// run, as delimited by [artboardByteRange] -- keeping its index so
+  /// everything referring to it by index stays correct. Returns false if the
+  /// file is unchanged.
+  ///
+  /// Every [Artboard] instanced from this artboard must be released first;
+  /// instances of other artboards are unaffected.
+  bool replaceArtboard(int index, Uint8List bytes);
 
   /// Returns a bindable artboard reference for use with data binding.
   ///
@@ -293,17 +339,60 @@ abstract class File {
   @internal
   void setScriptingState(LuauState vm);
 
+  /// Hands a booted wasm VM to the file, which owns it from here; every
+  /// script asset rebinds to it. Wasm flavored libraries only.
+  @internal
+  void adoptWasmScriptingVM(WasmScriptingVM vm);
+
+  /// Whether a wasm VM runs this file's scripts, adopted or booted from a
+  /// module asset the file carries.
+  bool get hasWasmScriptingVM;
+
+  /// Requires [registryName] on the adopted wasm VM and binds the result to
+  /// the script asset named [moduleName]; false when neither matches.
+  @internal
+  bool registerWasmScript(String moduleName, String registryName);
+
   /// The number of view models in the Rive file
   int get viewModelCount;
 
   /// Returns the view model at [index], or `null` if out of bounds.
   ViewModel? viewModelByIndex(int index);
 
+  /// The factory this file's resources were made with. Under deferred
+  /// rendering (the default) that is the render context's own recording
+  /// session, which every file it decodes and every artboard instanced from
+  /// them shares, so [Artboard.riveFactory] reports the same one. Web is the
+  /// exception: its render contexts are per canvas, so a file there owns a
+  /// session of its own.
+  Factory get riveFactory;
+
   /// Returns the view model with the given [name], or `null` if not found.
   ViewModel? viewModelByName(String name);
 
   /// Returns the default view model for the given [artboard].
   ViewModel? defaultArtboardViewModel(Artboard artboard);
+
+  /// The names of the file's global view models, in file order.
+  List<String> get globalViewModelNames;
+
+  /// Services the file's AnimaScript modules at the end of a frame: collects
+  /// what their scripts allocated during it and releases the host handles
+  /// they no longer hold. Without it a wasm script's heap only ever grows,
+  /// until one of its calls runs past the script time budget. That holds on
+  /// web too: the collector lives in the module, in its own linear memory,
+  /// which the browser's engine never collects.
+  ///
+  /// Hosts should not call it: the library already does at the end of every
+  /// frame Flutter draws, and prints what it returns in debug builds.
+  /// Returns a warning the runtime wants surfaced (a handle leak, the heap
+  /// growing), or null. Does nothing for a file without wasm scripts, or on a
+  /// runtime built without them or before this service.
+  String? frameBoundary();
+
+  /// The names of the file's artboards, in file order. Index into
+  /// [artboardAt] with a name's position.
+  List<String> get artboardNames;
 
   /// Decodes a Rive file from raw [bytes].
   ///
@@ -502,16 +591,16 @@ abstract interface class ViewModel {
   List<ViewModelProperty> get properties;
 
   /// Returns a view model instance by the given [index]
-  ViewModelInstance? createInstanceByIndex(int index);
+  BindableViewModelInstance? createInstanceByIndex(int index);
 
   /// Returns a view model instance by the given [name]
-  ViewModelInstance? createInstanceByName(String name);
+  BindableViewModelInstance? createInstanceByName(String name);
 
   /// Return the default view model instance
-  ViewModelInstance? createDefaultInstance();
+  BindableViewModelInstance? createDefaultInstance();
 
   /// Returns an empty/new view model instance
-  ViewModelInstance? createInstance();
+  BindableViewModelInstance? createInstance();
 
   /// Disposes of the view model and cleans up underlying native resources
   void dispose();
@@ -611,6 +700,29 @@ abstract interface class ViewModelInstance
   /// After disposal, the view model instance and its associated properties
   /// become unusable.
   bool get isDisposed;
+
+  /// Identity of the underlying core instance this wrapper points at, for
+  /// comparison only: two wrappers with the same identity wrap the same
+  /// instance. 0 when disposed.
+  @internal
+  int get nativeInstanceIdentity;
+}
+
+/// A [ViewModelInstance] the caller created and may bind: only these are
+/// accepted by `DataBind.byInstance` and the state machine's staging calls.
+///
+/// [ViewModel.createInstance] and its siblings return this type; instances
+/// read back from bound slots (and anything navigated from them via
+/// [viewModel] or list access) are plain [ViewModelInstance] views - read
+/// and write their properties, attach listeners, but they cannot be bound
+/// again, and casting one to this type throws: the runtime constructs views
+/// from a class that does not implement this interface. Navigation preserves
+/// bindability: [viewModel] on a bindable instance returns a bindable nested
+/// instance.
+abstract interface class BindableViewModelInstance
+    implements ViewModelInstance {
+  @override
+  BindableViewModelInstance? viewModel(String path);
 }
 
 @protected
@@ -1167,18 +1279,6 @@ abstract class Artboard {
   /// The bounding box in world coordinates.
   AABB get worldBounds;
 
-  /// Runs the GPU canvas pre-pass for this artboard and all nested artboards.
-  /// Must be called after advance() and before draw() to prevent ore render
-  /// passes from interleaving with the active 2D render pass (critical on
-  /// Metal tile-based GPUs). No-op when no drawCanvas scripts are present.
-  void drawCanvases();
-
-  /// Returns the [LuauState] for the first drawCanvas scripted object found
-  /// in this artboard or any nested artboard (recursive). Returns null when
-  /// no drawCanvas scripts exist. Used to open the GPU frame before calling
-  /// [drawCanvases].
-  LuauState? get drawCanvasState;
-
   /// Draws this artboard using the provided [renderer].
   void draw(Renderer renderer);
 
@@ -1246,6 +1346,9 @@ abstract class Artboard {
   /// Whether the artboard origin is at frame center (true) or original
   /// position.
   bool get frameOrigin;
+
+  /// Whether the artboard changed since it was last drawn. Drawing clears it.
+  bool get didChange;
 
   /// Sets whether the artboard origin is at frame center or original position.
   set frameOrigin(bool value);
@@ -1352,8 +1455,36 @@ abstract class Artboard {
 
   @internal
   void drawInternal(Renderer renderer);
+
+  /// Draws this artboard as a bitmap through the mesh buffers. False when the
+  /// renderer can't rasterize offscreen; the caller draws undeformed.
+  @internal
+  bool drawThroughMesh(
+    Renderer renderer,
+    double resolution,
+    VertexRenderBuffer vertices,
+    VertexRenderBuffer uvs,
+    IndexRenderBuffer indices,
+    BlendMode blendMode,
+    double opacity,
+  ) => false;
+
+  /// Maps 0..1 mesh UVs onto the raster. Null when none can be made.
+  @internal
+  Mat2D? meshUVTransform(double resolution) => null;
+
+  /// The live rotation/scale of this instance. Null on older libraries.
+  @internal
+  Mat2D? get selfTransform => null;
+
+  /// The live Bitmap Cache resolution, 1 without one. Null on older
+  /// libraries.
+  @internal
+  double? get rasterResolution => null;
   @internal
   void addToRenderPath(RenderPath renderPath, Mat2D transform);
+  /// Does nothing: the runtime's artboards no longer reset at the end of a
+  /// frame. Kept for callers until it's removed.
   @internal
   void reset();
   @internal
@@ -1362,6 +1493,13 @@ abstract class Artboard {
   void heightOverride(double height, int heightUnitValue, bool isRow);
   @internal
   void parentIsRow(bool isRow);
+  @internal
+  void parentIsStack(bool isStack);
+
+  /// Pins this artboard, hosted in a virtualized grid, to a cell (0-based);
+  /// -1 leaves it to auto placement.
+  @internal
+  void virtualGridCell(int column, int row);
   @internal
   void widthIntrinsicallySizeOverride(bool intrinsic);
   @internal
@@ -1377,7 +1515,8 @@ abstract class Artboard {
       double p0,
       double p1,
       double p2,
-      double p3);
+      double p3,
+      int scriptHandle);
 
   /// Applies [cascadeLayoutStyle] to every artboard in [artboards] in a single
   /// FFI/WASM round trip. The implementation packs native pointers into a
@@ -1392,7 +1531,8 @@ abstract class Artboard {
       double p0,
       double p1,
       double p2,
-      double p3);
+      double p3,
+      int scriptHandle);
 
   @internal
   void cascadeCollapse(bool collapse);
@@ -1486,6 +1626,36 @@ abstract class Artboard {
   int? get artboardUniqueId;
 }
 
+/// An artboard a shape is painted with: one instance of it, playing its
+/// default scene, rasterized offscreen whenever it changes and applied with
+/// [RenderPaint.modulatedArtboard].
+///
+/// Obtain via [File.artboardPaintSource].
+abstract class ArtboardPaintSource {
+  /// Bit set in [advance]'s result when something wants to keep advancing.
+  static const int keepGoing = 1;
+
+  /// Bit set in [advance]'s result when the artboard changed, so whatever
+  /// paints with it has to redraw.
+  static const int changed = 2;
+
+  /// Advances the scene by [elapsedSeconds] with the runtime's AdvanceFlags
+  /// bits in [flags]. Returns [keepGoing] and/or [changed].
+  int advance(double elapsedSeconds, int flags);
+
+  /// The artboard's own box, in its units.
+  AABB get bounds;
+
+  /// Binds the source to [dataContext], the native context of the artboard
+  /// the paint is in, or clears it (null).
+  void setDataContext(InternalDataContext? dataContext) {}
+
+  /// Applies pending binds. Returns whether the artboard changed.
+  bool updateDataBinds() => false;
+
+  void dispose();
+}
+
 /// A reference to an artboard that can be bound to a view model property.
 ///
 /// Obtain via [File.artboardToBind] and assign to [ViewModelInstanceArtboard.value].
@@ -1521,7 +1691,6 @@ abstract class InternalViewModelInstanceValue<T> {
   int instancePointerAddress = 0;
   bool suppressCallback = false;
   void dispose();
-  void advanced();
   set value(T val);
   set nativeValue(T val);
   void onChanged(void Function(T value) callback);
@@ -1560,7 +1729,10 @@ abstract interface class InternalViewModelInstanceString
 /// Use [ViewModelInstanceTrigger] instead.
 @internal
 abstract interface class InternalViewModelInstanceTrigger
-    extends InternalViewModelInstanceValue<int> {}
+    extends InternalViewModelInstanceValue<int> {
+  /// Adds [fires] to the runtime's count, without echoing to onChanged.
+  void fire(int fires);
+}
 
 /// This class is used internally and should not be used directly.
 ///
@@ -1572,7 +1744,13 @@ abstract interface class InternalViewModelInstanceEnum
 /// This class is used internally and should not be used directly.
 @internal
 abstract interface class InternalViewModelInstanceAsset
-    extends InternalViewModelInstanceValue<int> {}
+    extends InternalViewModelInstanceValue<int> {
+  /// The render image the runtime set directly on this asset property (e.g. a
+  /// script assigning `canvas.image`), or null when the property references a
+  /// file asset by index (the normal case) or holds no image. The returned
+  /// [RenderImage] owns its own reference and must be disposed by the caller.
+  RenderImage? get renderImage;
+}
 
 /// This class is used internally and should not be used directly.
 ///
@@ -1695,6 +1873,14 @@ enum HitResult {
   hitOpaque,
 }
 
+/// Mouse button a pointer down/up belongs to. Listeners match on it; touch
+/// and stylus input is always [primary].
+enum PointerButton {
+  primary,
+  secondary,
+  middle,
+}
+
 /// Keyboard modifier keys for input events.
 enum KeyModifiers {
   /// Shift key modifier.
@@ -1707,7 +1893,18 @@ enum KeyModifiers {
   alt,
 
   /// Meta/Command key modifier.
-  meta,
+  meta;
+
+  /// The bitmask `FocusManager.keyInput` expects (bit = `1 << index`) for
+  /// the modifiers currently held on [keyboard].
+  static int bitsOf(HardwareKeyboard keyboard) {
+    var bits = 0;
+    if (keyboard.isShiftPressed) bits |= 1 << shift.index;
+    if (keyboard.isControlPressed) bits |= 1 << ctrl.index;
+    if (keyboard.isAltPressed) bits |= 1 << alt.index;
+    if (keyboard.isMetaPressed) bits |= 1 << meta.index;
+    return bits;
+  }
 }
 
 /// Keyboard key codes for input events.
@@ -2254,6 +2451,47 @@ abstract class GamepadInvocationHandle {
   void dispose();
 }
 
+/// A bound view model instance slot: the canonical Dart wrapper plus whether
+/// the state machine minted it (and therefore owns its disposal).
+class _BoundSlot {
+  _BoundSlot(this.instance, {required this.minted})
+      : identity = instance.nativeInstanceIdentity;
+
+  final ViewModelInstance instance;
+
+  /// The wrapped core instance's identity, fixed for the wrapper's lifetime;
+  /// cached so cache-validation reads cost one native probe instead of two.
+  final int identity;
+
+  final bool minted;
+}
+
+/// Snapshot of a state machine's focus state, for host polling.
+class FocusState {
+  /// True if any element holds focus in the state machine's focus manager.
+  final bool hasFocus;
+
+  /// True if the focused element accepts keyboard input (a TextInput, or a
+  /// node with key/text listeners). False when nothing is focused.
+  final bool expectsKeyboardInput;
+
+  const FocusState({
+    required this.hasFocus,
+    required this.expectsKeyboardInput,
+  });
+
+  /// Unpacks the native representation: bit 0 hasFocus, bit 1
+  /// expectsKeyboardInput.
+  factory FocusState.fromBits(int bits) => FocusState(
+        hasFocus: bits & 1 != 0,
+        expectsKeyboardInput: bits & 2 != 0,
+      );
+
+  @override
+  String toString() => 'FocusState(hasFocus: $hasFocus, '
+      'expectsKeyboardInput: $expectsKeyboardInput)';
+}
+
 /// A Rive state machine that drives animations based on inputs and logic.
 ///
 /// State machines provide interactive control over animations. Obtain via
@@ -2261,7 +2499,13 @@ abstract class GamepadInvocationHandle {
 /// [Artboard.defaultStateMachine].
 abstract class StateMachine
     implements EventListenerInterface, AdvanceRequestInterface {
-  ViewModelInstance? _boundRuntimeViewModelInstance;
+  /// Canonical wrapper per bound slot (the main plus each global name). Set
+  /// stores the exact object the caller passed; reads mint (and then reuse) a
+  /// wrapper only for slots the runtime completed at bind time. Keeping one
+  /// wrapper per slot is what makes property listeners work: callbacks are
+  /// flushed per advance on exactly these wrappers.
+  _BoundSlot? _mainSlot;
+  final Map<String, _BoundSlot> _globalSlots = {};
 
   /// The name of this state machine.
   String get name;
@@ -2278,16 +2522,29 @@ abstract class StateMachine
   bool advanceAndApply(double elapsedSeconds);
 
   /// Releases resources associated with this state machine.
+  ///
+  /// View model instances the runtime created (e.g. defaults read back after
+  /// [bind]) are disposed with it; instances you passed in are left
+  /// untouched.
   @mustCallSuper
   void dispose() {
-    _boundRuntimeViewModelInstance
-        ?.removeAdvanceRequestListener(requestAdvance);
+    _releaseSlot(_mainSlot);
+    _mainSlot = null;
+    _globalSlots.values.forEach(_releaseSlot);
+    _globalSlots.clear();
     removeAllAdvanceRequestListeners();
   }
 
   /// Get the focus manager for this state machine.
   /// Returns the active focus manager (external if set, internal otherwise).
   focus.FocusManager? get focusManager;
+
+  /// Whether the focus tree (unified across nested artboards) has any
+  /// focusable content. Cheap; safe to poll.
+  bool get hasFocusNodes;
+
+  /// Snapshot of the current focus state.
+  FocusState get focusState;
 
   /// Returns a list of all inputs in the state machine.
   @Deprecated(_useDataBindingDeprecationMessageSMInput)
@@ -2350,9 +2607,14 @@ abstract class StateMachine
   @Deprecated(_useDataBindingDeprecationMessageSMInput)
   Input? inputAt(int index);
 
-  /// The view model instance that is bound to the state machine.
-  ViewModelInstance? get boundRuntimeViewModelInstance =>
-      _boundRuntimeViewModelInstance;
+  /// The main view model instance currently bound to the state machine, or
+  /// null if none is bound yet. This never creates one - defaults exist
+  /// after [bind]. Reading twice returns the same object.
+  ViewModelInstance? get boundRuntimeViewModelInstance => _readSlot(
+      _mainSlot,
+      nativeMainViewModelInstanceIdentity(),
+      nativeMainViewModelInstance,
+      (slot) => _mainSlot = slot);
 
   /// Returns a list of events that have been reported by the state machine.
   List<Event> reportedEvents();
@@ -2363,22 +2625,62 @@ abstract class StateMachine
   bool hitTest(Vec2D position);
 
   /// Notifies the state machine of a pointer down event at [position].
-  HitResult pointerDown(Vec2D position, {int pointerId = 0});
+  HitResult pointerDown(Vec2D position,
+      {int pointerId = 0, PointerButton button = PointerButton.primary});
 
   /// Notifies the state machine of a pointer move event at [position].
   HitResult pointerMove(Vec2D position, {double? timeStamp, int pointerId = 0});
 
   /// Notifies the state machine of a pointer up event at [position].
-  HitResult pointerUp(Vec2D position, {int pointerId = 0});
+  HitResult pointerUp(Vec2D position,
+      {int pointerId = 0, PointerButton button = PointerButton.primary});
 
   /// Notifies the state machine that the pointer exited at [position].
   HitResult pointerExit(Vec2D position, {int pointerId = 0});
 
+  /// Notifies the state machine of indirect scroll input at [position] -- a
+  /// wheel, or a trackpad gesture the platform already classified as a
+  /// scroll. Direct touch scrolling stays on the pointer methods above.
+  ///
+  /// These five default to doing nothing so that adding them stays source
+  /// compatible for anything implementing StateMachine, matching the no-op
+  /// defaults on the C++ Scene. The runtime implementations override them.
+  HitResult pointerScroll(Vec2D position, ScrollEvent event,
+          {double? timeStamp, int pointerId = 0}) =>
+      HitResult.none;
+
+  /// Whether anything under [position] would move for [event]. Lets a host
+  /// chain the gesture outward without committing it first.
+  bool wantsScroll(Vec2D position, ScrollEvent event) => false;
+
+  /// Whether an interactive scroll view sits under [position] at all, even
+  /// one that cannot move. Keeps a gesture from escaping to the host.
+  bool hasScrollTargetAt(Vec2D position) => false;
+
+  /// Whether a listener under [position] responds to presses of [button],
+  /// looking through nested artboards. Lets a host keep a mouse button for
+  /// its own use wherever nothing in the scene wants it.
+  bool listensToButtonAt(Vec2D position, PointerButton button) => false;
+
+  /// Whether an opaque hit that cannot scroll sits under [position]. It
+  /// blocks scroll to whatever lies behind it, as an opaque hit does for
+  /// pointer events.
+  bool scrollOccludedAt(Vec2D position) => false;
+
+  /// Whether a scroll gesture is currently latched to a view in this state
+  /// machine.
+  bool get hasScrollLatch => false;
+
+  /// Ends any scroll gesture in flight, latch included.
+  void cancelScroll() {}
+
   /// Notifies the state machine of a drag start event at [position].
-  HitResult dragStart(Vec2D position, {double? timeStamp});
+  HitResult dragStart(Vec2D position,
+      {double? timeStamp, PointerButton button = PointerButton.primary});
 
   /// Notifies the state machine of a drag end event at [position].
-  HitResult dragEnd(Vec2D position, {double? timeStamp});
+  HitResult dragEnd(Vec2D position,
+      {double? timeStamp, PointerButton button = PointerButton.primary});
 
   /// Submit a binary batch of gamepad records (connected/update/disconnected)
   /// using the wire format defined in `gamepad_batch.hpp`. Returns `false`
@@ -2392,36 +2694,237 @@ abstract class StateMachine
 
   /// Enable semantics for this state machine. Creates the internal semantic
   /// manager and builds the semantic tree. No-op if already enabled.
-  @experimental
   @internal
   void enableSemantics();
 
   /// Returns the semantic diff since the last call.
   /// Returns an empty diff if semantics is not enabled or nothing changed.
-  @experimental
   @internal
   SemanticsDiff drainSemanticsDiff();
 
   /// Request focus on the FocusData sibling of the SemanticData that owns
   /// the given semantic node ID. Returns true if focus was set.
-  @experimental
   @internal
   bool focusSemanticNode(int semanticNodeId);
 
   /// Fires a semantic action on the semantic node with the given
   /// [semanticNodeId].
+  @internal
   void fireSemanticAction(int semanticNodeId, SemanticActionType actionType);
 
   /// Binds the provided [viewModelInstance] to the state machine
+  /// immediately: [setViewModelInstance] followed by [bind].
   ///
   /// Docs: https://rive.app/docs/runtimes/data-binding
-  @mustCallSuper
-  void bindViewModelInstance(ViewModelInstance viewModelInstance) {
-    _boundRuntimeViewModelInstance
-        ?.removeAdvanceRequestListener(requestAdvance);
-    _boundRuntimeViewModelInstance = viewModelInstance;
-    viewModelInstance.addAdvanceRequestListener(requestAdvance);
+  void bindViewModelInstance(BindableViewModelInstance viewModelInstance) {
+    setViewModelInstance(viewModelInstance);
+    bind();
   }
+
+  /// Chooses [viewModelInstance] as the main view model instance. Nothing
+  /// changes until [bind] runs: set several instances, then call [bind] once
+  /// to apply them all in a single rebind.
+  void setViewModelInstance(BindableViewModelInstance viewModelInstance) {
+    nativeSetViewModelInstance(viewModelInstance);
+    _mainSlot = _pointSlot(_mainSlot, viewModelInstance, minted: false);
+  }
+
+  /// Chooses [viewModelInstance] to bind for the global view model [name].
+  /// Nothing changes until [bind] runs: set several instances, then call
+  /// [bind] once to apply them all in a single rebind.
+  ///
+  /// Returns false if [name] does not match a global view model in the file.
+  bool setGlobalViewModelInstance(
+      String name, BindableViewModelInstance viewModelInstance) {
+    if (!nativeSetGlobalViewModelInstance(name, viewModelInstance)) {
+      return false;
+    }
+    _globalSlots[name] =
+        _pointSlot(_globalSlots[name], viewModelInstance, minted: false);
+    return true;
+  }
+
+  /// Stages [viewModelInstance] as the main instance and transfers its
+  /// lifetime to this state machine: the passed wrapper is released here
+  /// (the staged core instance survives it) and the canonical read-back
+  /// view takes its place in the registry, disposed when its slot is
+  /// superseded or the machine is disposed.
+  @internal
+  void adoptViewModelInstance(BindableViewModelInstance viewModelInstance) {
+    nativeSetViewModelInstance(viewModelInstance);
+    viewModelInstance.dispose();
+    // Set stages the instance into the data context, so the canonical view
+    // wrapper is mintable immediately.
+    _mainSlot =
+        _pointSlot(_mainSlot, nativeMainViewModelInstance()!, minted: true);
+  }
+
+  /// Stages [viewModelInstance] for the global view model [name] and
+  /// transfers its lifetime to this state machine, like
+  /// [adoptViewModelInstance]. Returns false if [name] does not match a
+  /// global view model in the file.
+  @internal
+  bool adoptGlobalViewModelInstance(
+      String name, BindableViewModelInstance viewModelInstance) {
+    if (!nativeSetGlobalViewModelInstance(name, viewModelInstance)) {
+      return false;
+    }
+    viewModelInstance.dispose();
+    _globalSlots[name] = _pointSlot(
+        _globalSlots[name], nativeGlobalViewModelInstance(name)!,
+        minted: true);
+    return true;
+  }
+
+  /// Applies every instance set since the last bind, in one rebind - the
+  /// expensive data binding call. Anything never set receives a default
+  /// instance (the main and every global view model); anything bound earlier
+  /// and not changed keeps its instance.
+  void bind() {
+    nativeBind();
+  }
+
+  /// The instance currently bound for the global view model [name], or null
+  /// if none is bound yet. This never creates one - defaults exist after
+  /// [bind]. Reading the same name twice returns the same object.
+  ViewModelInstance? globalViewModelInstance(String name) => _readSlot(
+      _globalSlots[name],
+      nativeGlobalViewModelInstanceIdentity(name),
+      () => nativeGlobalViewModelInstance(name),
+      (slot) =>
+          slot == null ? _globalSlots.remove(name) : _globalSlots[name] = slot);
+
+  /// The canonical read of a slot: an empty slot (identity 0 - or an invalid
+  /// name) releases any stale wrapper and stores null; an occupied slot
+  /// keeps or re-mints the canonical wrapper via [_refreshSlot], storing it
+  /// only on success (a mint failure keeps the current slot untouched).
+  ViewModelInstance? _readSlot(_BoundSlot? current, int identity,
+      ViewModelInstance? Function() mint, void Function(_BoundSlot?) store) {
+    if (identity == 0) {
+      _releaseSlot(current);
+      store(null);
+      return null;
+    }
+    final slot = _refreshSlot(current, identity, mint);
+    if (slot == null) {
+      return null;
+    }
+    store(slot);
+    return slot.instance;
+  }
+
+  /// Slots currently holding each instance; the advance-request listener is
+  /// attached at the first slot and removed at the last, so releasing one of
+  /// several slots sharing an instance never severs its wiring.
+  final Map<ViewModelInstance, int> _slotAttachCounts = {};
+
+  /// Points a slot at [instance], releasing any previous occupant.
+  _BoundSlot _pointSlot(_BoundSlot? previous, ViewModelInstance instance,
+      {required bool minted}) {
+    // Only user instances can be re-pointed at their own slot: minted
+    // wrappers are view-classed and staging only accepts
+    // [BindableViewModelInstance], so they cannot re-enter here. Keeping
+    // the slot therefore never changes its ownership.
+    if (previous != null && identical(previous.instance, instance)) {
+      return previous;
+    }
+    _releaseSlot(previous);
+    final count = _slotAttachCounts[instance] ?? 0;
+    if (count == 0) {
+      instance.addAdvanceRequestListener(requestAdvance);
+    }
+    _slotAttachCounts[instance] = count + 1;
+    return _BoundSlot(instance, minted: minted);
+  }
+
+  /// Detaches a slot's wrapper. Only when this was the instance's last slot
+  /// is the advance-request listener removed and, for wrappers this state
+  /// machine minted, the wrapper disposed; caller-passed instances are never
+  /// disposed.
+  void _releaseSlot(_BoundSlot? slot) {
+    if (slot == null) {
+      return;
+    }
+    final instance = slot.instance;
+    final count = _slotAttachCounts[instance] ?? 1;
+    if (count > 1) {
+      _slotAttachCounts[instance] = count - 1;
+      return;
+    }
+    _slotAttachCounts.remove(instance);
+    instance.removeAdvanceRequestListener(requestAdvance);
+    if (slot.minted) {
+      instance.dispose();
+    }
+  }
+
+  /// The canonical slot for a core occupant with [identity]: keeps [current]
+  /// when its wrapper still points at that occupant, otherwise mints (and
+  /// owns) a fresh wrapper. Null when minting fails.
+  _BoundSlot? _refreshSlot(
+      _BoundSlot? current, int identity, ViewModelInstance? Function() mint) {
+    if (current != null &&
+        !current.instance.isDisposed &&
+        current.identity == identity) {
+      return current;
+    }
+    final fresh = mint();
+    if (fresh == null) {
+      return null;
+    }
+    return _pointSlot(current, fresh, minted: true);
+  }
+
+  /// Flushes property callbacks for every view model instance bound to this
+  /// state machine: the main plus each registered global. Backends call this
+  /// once per advance.
+  @internal
+  void handleViewModelInstanceCallbacks() {
+    final main = _mainSlot?.instance;
+    main?.handleCallbacks();
+    if (_globalSlots.isEmpty) {
+      return;
+    }
+    // Iterate a copy: listeners run synchronously and may register new slots
+    // (e.g. a first read of an auto-created global) mid-flush. Flushing is
+    // idempotent per advance, so aliased slots are harmless.
+    for (final slot in List.of(_globalSlots.values, growable: false)) {
+      slot.instance.handleCallbacks();
+    }
+  }
+
+  /* Backend hooks for the data binding surface above. */
+
+  @protected
+  void nativeSetViewModelInstance(ViewModelInstance viewModelInstance);
+
+  @protected
+  bool nativeSetGlobalViewModelInstance(
+      String name, ViewModelInstance viewModelInstance);
+
+  @protected
+  void nativeBind();
+
+  /// Mints a new wrapper for the instance in the named global slot, or null
+  /// when the slot is unset.
+  @protected
+  ViewModelInstance? nativeGlobalViewModelInstance(String name);
+
+  /// Identity of the underlying core instance in the named global slot
+  /// (0 when unset), for comparison with
+  /// [ViewModelInstance.nativeInstanceIdentity].
+  @protected
+  int nativeGlobalViewModelInstanceIdentity(String name);
+
+  /// Mints a new wrapper for the main instance on the data context, or null
+  /// when none is bound.
+  @protected
+  ViewModelInstance? nativeMainViewModelInstance();
+
+  /// Identity of the underlying core main instance (0 when none), for
+  /// comparison with [ViewModelInstance.nativeInstanceIdentity].
+  @protected
+  int nativeMainViewModelInstanceIdentity();
 
   /// Registers a callback that is invoked when a layer state change occurs
   /// during [advanceAndApply].

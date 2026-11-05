@@ -1,3 +1,4 @@
+import 'dart:convert';
 import 'dart:js_interop' as js;
 import 'dart:js_interop_unsafe';
 import 'dart:typed_data';
@@ -167,6 +168,20 @@ class SemanticsWasm {
     );
   }
 
+  /// Decodes a native UTF-8 string leniently: malformed sequences become
+  /// U+FFFD instead of throwing. A bad label must not abort the whole diff
+  /// decode - the native dirty state is already cleared by drain time, so
+  /// an aborted decode would lose the update permanently.
+  static String _decodeUtf8(int ptr) {
+    if (ptr == 0) return '';
+    final codeUnits =
+        (RiveWasm.stringViewU8.callAsFunction(null, ptr.toJS)
+                as js.JSUint8Array)
+            .toDart;
+    if (codeUnits.isEmpty) return '';
+    return utf8.decode(codeUnits, allowMalformed: true);
+  }
+
   static List<SemanticsDiffNode> _readNodes(int ptr, int count) {
     if (ptr == 0 || count <= 0) return const [];
     final data = RiveWasm.heapDataView(ptr, count * _nodeSize);
@@ -178,9 +193,9 @@ class SemanticsWasm {
       return SemanticsDiffNode(
         id: data.getUint32(o, Endian.little),
         role: SemanticRole.fromValue(data.getUint32(o + 4, Endian.little)),
-        label: labelPtr == 0 ? '' : RiveWasm.toDartString(labelPtr),
-        value: valuePtr == 0 ? '' : RiveWasm.toDartString(valuePtr),
-        hint: hintPtr == 0 ? '' : RiveWasm.toDartString(hintPtr),
+        label: _decodeUtf8(labelPtr),
+        value: _decodeUtf8(valuePtr),
+        hint: _decodeUtf8(hintPtr),
         stateFlags: data.getUint32(o + 20, Endian.little),
         traitFlags: data.getUint32(o + 24, Endian.little),
         minX: data.getFloat32(o + 28, Endian.little),

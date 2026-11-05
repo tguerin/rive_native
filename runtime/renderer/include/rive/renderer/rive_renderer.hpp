@@ -26,120 +26,194 @@ class RiveRenderPaint;
 class RiveRenderer : public Renderer
 {
 public:
-    RiveRenderer(gpu::RenderContext*);
-    ~RiveRenderer() override;
+  RiveRenderer(gpu::RenderContext*);
+  ~RiveRenderer() override;
 
-    void save() override;
-    void restore() override;
-    void transform(const Mat2D& matrix) override;
-    void drawPath(RenderPath*, RenderPaint*) override;
-    void clipPath(RenderPath*) override;
-    void drawImage(const RenderImage*,
-                   ImageSampler,
-                   BlendMode,
-                   float opacity) override;
-    void drawImageMesh(const RenderImage*,
-                       ImageSampler,
-                       rcp<RenderBuffer> vertices_f32,
-                       rcp<RenderBuffer> uvCoords_f32,
-                       rcp<RenderBuffer> indices_u16,
-                       uint32_t vertexCount,
-                       uint32_t indexCount,
-                       BlendMode,
-                       float opacity) override;
-    void modulateOpacity(float opacity) override;
+  void save() override;
+  void restore() override;
+  void transform(const Mat2D& matrix) override;
+  void drawPath(RenderPath*, RenderPaint*) override;
+  void clipPath(RenderPath*) override;
+  void drawImage(const RenderImage*, ImageSampler, BlendMode, float opacity)
+      override;
+  void drawImage(
+      const RenderImage*,
+      ImageSampler,
+      BlendMode,
+      float opacity,
+      float additiveness) override;
 
-    // Determines if a path is an axis-aligned rectangle that can be represented
-    // by rive::AABB.
-    static bool IsAABB(const RawPath&, AABB* result);
+  void applyLayerMask(const RenderImage*, ImageSampler, LayerMaskMode) override;
+  void clipStroke(RenderPath*, const StrokeParams&) override;
+  void drawImageMesh(
+      const RenderImage*,
+      ImageSampler,
+      rcp<RenderBuffer> vertices_f32,
+      rcp<RenderBuffer> uvCoords_f32,
+      rcp<RenderBuffer> indices_u16,
+      uint32_t vertexCount,
+      uint32_t indexCount,
+      BlendMode,
+      float opacity) override;
+  void drawImageMesh(
+      const RenderImage*,
+      ImageSampler,
+      rcp<RenderBuffer> vertices_f32,
+      rcp<RenderBuffer> uvCoords_f32,
+      rcp<RenderBuffer> indices_u16,
+      uint32_t vertexCount,
+      uint32_t indexCount,
+      BlendMode,
+      float opacity,
+      float additiveness) override;
+  void drawImageMeshInstanced(
+      const RenderImage*,
+      ImageSampler,
+      rcp<RenderBuffer> vertices_f32,
+      rcp<RenderBuffer> uvCoords_f32,
+      rcp<RenderBuffer> indices_u16,
+      uint32_t vertexCount,
+      uint32_t indexCount,
+      rcp<ImageMeshInstances>) override;
+  void modulateOpacity(float opacity) override;
+  void modulateColor(ColorInt color, bool replace = false) override;
+
+  bool currentTransform(Mat2D* out) const override
+  {
+    *out = m_renderStateStack.back().matrix;
+    return true;
+  }
+
+  bool currentModulatedOpacity(float* out) const override
+  {
+    *out = m_renderStateStack.back().modulatedOpacity;
+    return true;
+  }
+
+  // Determines if a path is an axis-aligned rectangle that can be represented
+  // by rive::AABB.
+  static bool IsAABB(const RawPath&, AABB* result);
 
 #ifdef TESTING
-    bool hasClipRect() const
-    {
-        return m_renderStateStack.back().clipRectInverseMatrix != nullptr;
-    }
-    const AABB& getClipRect() const
-    {
-        return m_renderStateStack.back().clipRect;
-    }
-    const Mat2D& getClipRectMatrix() const
-    {
-        return m_renderStateStack.back().clipRectMatrix;
-    }
-    float currentModulatedOpacity() const
-    {
-        return m_renderStateStack.back().modulatedOpacity;
-    }
+  bool hasClipRect() const
+  {
+    return m_renderStateStack.back().clipRectInverseMatrix != nullptr;
+  }
+  const AABB& getClipRect() const { return m_renderStateStack.back().clipRect; }
+  const Mat2D& getClipRectMatrix() const
+  {
+    return m_renderStateStack.back().clipRectMatrix;
+  }
+  float currentModulatedOpacity() const
+  {
+    return m_renderStateStack.back().modulatedOpacity;
+  }
+  ColorInt currentModulatedColor() const
+  {
+    return m_renderStateStack.back().modulatedColor;
+  }
 #endif
 
 private:
-    void clipRectImpl(AABB, const RiveRenderPath* originalPath);
-    void clipPathImpl(const RiveRenderPath*);
+  enum class ForceClosed : bool
+  {
+    no,
+    yes,
+  };
 
-    // Clips and pushes the given draw to m_context. If the clipped draw is too
-    // complex to be supported by the GPU buffers, even after a logical flush,
-    // then nothing is drawn.
-    void clipAndPushDraw(gpu::DrawUniquePtr);
+  void clipRectImpl(AABB, const RiveRenderPath* originalPath);
+  void clipPathImpl(
+      const RiveRenderPath*,
+      std::optional<StrokeParams> = {},
+      float feather = 0.0f,
+      ForceClosed forceClosed = ForceClosed::no,
+      IAABB* boundsOut = nullptr);
 
-    // Pushes any necessary clip updates to m_internalDrawBatch and sets the
-    // Draw's clipID and clipRectInverseMatrix, if any. Returns failure if the
-    // operation failed, at which point the caller should issue a logical flush
-    // and try again.
-    enum class ApplyClipResult
-    {
-        success,
-        failure,
-        fullyClipped,
-    };
-    [[nodiscard]] ApplyClipResult applyClip(gpu::Draw*);
+  // Clips and pushes the given draw to m_context. If the clipped draw is too
+  // complex to be supported by the GPU buffers, even after a logical flush,
+  // then nothing is drawn.
+  void clipAndPushDraw(gpu::DrawUniquePtr);
 
-    struct RenderState
-    {
-        Mat2D matrix;
-        size_t clipStackHeight = 0;
-        AABB clipRect;
-        Mat2D clipRectMatrix;
-        IAABB clipRectPixelBounds;
-        const gpu::ClipRectInverseMatrix* clipRectInverseMatrix = nullptr;
-        float modulatedOpacity = 1.0f;
+  // Pushes any necessary clip updates to m_internalDrawBatch and sets the
+  // Draw's clipID and clipRectInverseMatrix, if any. Returns failure if the
+  // operation failed, at which point the caller should issue a logical flush
+  // and try again.
+  enum class ApplyClipResult
+  {
+    success,
+    failure,
+    fullyClipped,
+  };
+  [[nodiscard]] ApplyClipResult applyClip(gpu::Draw*);
 
-        // The pixel bounds for all clipping (clip rects *and* clip paths),
-        // which defaults to a maximally-large rectangle
-        IAABB overallClipPixelBounds = IAABB::makeMaximal();
-    };
-    std::vector<RenderState> m_renderStateStack{1};
+  struct RenderState
+  {
+    Mat2D matrix;
+    size_t clipStackHeight = 0;
+    AABB clipRect;
+    Mat2D clipRectMatrix;
+    IAABB clipRectPixelBounds;
+    const gpu::ClipRectInverseMatrix* clipRectInverseMatrix = nullptr;
+    float modulatedOpacity = 1.0f;
+    ColorInt modulatedColor = 0xFFFFFFFF;
 
-    struct ClipElement
-    {
-        ClipElement() = default;
-        ClipElement(const Mat2D&,
-                    const RiveRenderPath*,
-                    FillRule,
-                    IAABB pixelBounds);
-        ~ClipElement();
+    // The pixel bounds for all clipping (clip rects *and* clip paths),
+    // which defaults to a maximally-large rectangle
+    IAABB overallClipPixelBounds = IAABB::makeMaximal();
+  };
+  std::vector<RenderState> m_renderStateStack{1};
 
-        void reset(const Mat2D&,
-                   const RiveRenderPath*,
-                   FillRule,
-                   IAABB pixelBounds);
-        bool isEquivalent(const Mat2D&, const RiveRenderPath*) const;
+  // A draw's color with this scope's modulation folded in.
+  ColorInt modulated(ColorInt color, float opacity) const;
 
-        Mat2D matrix;
-        uint64_t rawPathMutationID;
-        AABB pathBounds;
-        IAABB pixelBounds;
-        rcp<const RiveRenderPath> path;
-        FillRule fillRule; // Bc RiveRenderPath fillRule can mutate during the
-                           // artboard draw process.
-        uint32_t clipID;
-    };
-    std::vector<ClipElement> m_clipStack;
+  struct ClipElement
+  {
+    ClipElement() = default;
+    ClipElement(
+        const Mat2D&,
+        const RiveRenderPath*,
+        FillRule,
+        IAABB pixelBounds,
+        std::optional<StrokeParams>,
+        float feather,
+        bool forceClosed);
+    ~ClipElement();
 
-    gpu::RenderContext* const m_context;
+    void reset(
+        const Mat2D&,
+        const RiveRenderPath*,
+        FillRule,
+        IAABB pixelBounds,
+        std::optional<StrokeParams>,
+        float feather,
+        bool forceClosed);
+    bool isEquivalent(
+        const Mat2D&,
+        const RiveRenderPath*,
+        std::optional<StrokeParams>,
+        float feather,
+        bool forceClosed) const;
 
-    std::vector<gpu::DrawUniquePtr> m_internalDrawBatch;
+    Mat2D matrix;
+    uint64_t rawPathMutationID;
+    AABB pathBounds;
+    IAABB pixelBounds;
+    rcp<const RiveRenderPath> path;
+    FillRule fillRule; // Bc RiveRenderPath fillRule can mutate during the
+                       // artboard draw process.
+    uint32_t clipID;
 
-    // Path of the rectangle [0, 0, 1, 1]. Used to draw images.
-    rcp<RiveRenderPath> m_unitRectPath;
+    std::optional<StrokeParams> stroke;
+    float feather;
+    bool forceClosed;
+  };
+  std::vector<ClipElement> m_clipStack;
+
+  gpu::RenderContext* const m_context;
+
+  std::vector<gpu::DrawUniquePtr> m_internalDrawBatch;
+
+  // Path of the rectangle [0, 0, 1, 1]. Used to draw images.
+  rcp<RiveRenderPath> m_unitRectPath;
 };
 } // namespace rive

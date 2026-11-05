@@ -10,16 +10,20 @@ import 'package:rive_native/rive_native.dart';
 import 'src/rive_native_ffi.dart'
     if (dart.library.js_interop) 'src/rive_native_web.dart';
 
+export 'src/draw_optimization.dart';
 export 'src/render_resolution.dart';
 export 'src/rive.dart' hide RiveProfiler;
 export 'src/rive_renderer.dart';
 export 'package:rive_native/math.dart';
+export 'package:rive_native/scroll.dart';
 export 'src/rive_artboard_layout.dart';
 export 'src/rive_ticker_aware_painter.dart';
 export 'src/rive_widget.dart';
+export 'src/rive_focus_widget.dart';
 export 'src/rive_hit_test.dart';
 export 'src/rive_semantics.dart';
 export 'src/defaults.dart';
+export 'src/scripting_flavor.dart';
 export 'rive_audio.dart' show AudioSource;
 export 'rive_text.dart' show Font;
 
@@ -105,16 +109,34 @@ abstract base class RivePainter extends ChangeNotifier {
 abstract base class RenderTexturePainter extends RivePainter {
   bool get clear => true;
   Color get background;
-  bool paint(RenderTexture texture, double devicePixelRatio, Size size,
-      double elapsedSeconds);
+
+  /// The factory the painted content was made with, so the texture can
+  /// attach its recording session - a sessionless texture draws nothing on
+  /// native. Defaults to [Factory.rive], which is correct for content
+  /// decoded and created on it. Override with the decoded file's
+  /// [File.riveFactory] when content records elsewhere - on web that opts
+  /// the texture into the per-file session worker path (single-file
+  /// content only; sessionless web textures render through the immediate
+  /// fallback) - or with null when the session is managed manually.
+  Factory? get riveFactory => Factory.rive;
+
+  /// Advances the content by [elapsedSeconds] and returns whether it wants
+  /// another frame. The render object calls this once per frame, before it
+  /// decides whether to [paint].
+  bool advance(double elapsedSeconds);
+
+  /// Whether the last [advance] changed what [paint] draws. While false, the
+  /// render object may skip the draw and keep showing the last frame.
+  bool get needsPaint => true;
+
+  /// Draws the current state into [texture]. Does not advance.
+  void paint(RenderTexture texture, double devicePixelRatio, Size size);
+
   bool get paintsCanvas => false;
   bool get needsClip => false;
   void paintCanvas(Canvas canvas, Offset offset, Size size) {}
   void textureChanged() {}
 
-  /// Called before the main RenderContext frame opens to run scripted canvas
-  /// draws in their own frame. Override in subclasses that manage an artboard.
-  void prepassCanvases() {}
 }
 
 abstract base class RenderTexture {
@@ -129,6 +151,22 @@ abstract base class RenderTexture {
 
   bool clear(Color color, [bool write = true]);
   bool flush(double devicePixelRatio);
+
+  /// Attach a recording session. Pass null to detach; a detached texture
+  /// draws nothing, deferred is the only mode.
+  void useDeferredSession(Factory? session) {}
+
+  /// Set while paused so the driver skips recording, since the session
+  /// stream would otherwise grow unboundedly with nothing draining.
+  bool get deferredPaused => false;
+
+  /// Whether the replay worker can take another frame. The driver skips
+  /// recording when false, pacing the producer without blocking.
+  bool get canAcceptDeferredFrame => true;
+
+  /// Whether the texture's backing is on screen with a real size. A frame
+  /// recorded before then replays with no screen to present to.
+  bool get hasVisibleBacking => true;
 
   int get actualWidth;
   int get actualHeight;
@@ -181,9 +219,11 @@ abstract base class RenderTexture {
     _textureChangedListeners.remove(callback);
   }
 
-  /// Removes every texture-changed listener. Call from [dispose].
+  /// Removes every texture-changed listener, including the deprecated
+  /// [onTextureChanged] callback. Call from [dispose].
   void removeAllTextureChangedListeners() {
     _textureChangedListeners.clear();
+    _textureChangedCallback = null;
   }
 
   /// Notifies every registered listener (and the deprecated single callback)
@@ -265,10 +305,26 @@ abstract class RiveNative {
   static bool _isInitialized = false;
   static bool get isInitialized => _isInitialized;
 
-  static Future<bool> init() async {
+  /// Whether the app asked for Android textures to be handed to Flutter as
+  /// hardware buffers, as decided by the first [init] call. It is the
+  /// request, not the outcome: a device below API 29 or one whose GL
+  /// context cannot import hardware buffers takes the Surface path with this
+  /// still true, and it is meaningless off Android.
+  static bool get androidHardwareBuffers => _androidHardwareBuffers;
+  static bool _androidHardwareBuffers = false;
+
+  /// [androidHardwareBuffers] opts Android in to rendering each texture
+  /// straight into hardware buffers that Flutter samples directly, instead
+  /// of through a Surface. Available on API 29 and up; devices that cannot
+  /// take the path keep the Surface one. Off by default: opt in per app,
+  /// and opt out again by not setting it, with no other code change. The
+  /// first call decides; the runtime calls [init] again internally without
+  /// arguments, and those calls do not change it.
+  static Future<bool> init({bool androidHardwareBuffers = false}) async {
     if (_initializeCompleter != null) {
       return _initializeCompleter!.future;
     }
+    _androidHardwareBuffers = androidHardwareBuffers;
     _initializeCompleter = Completer<bool>();
     final riveNative = await makeRiveNative();
     if (riveNative != null) {
@@ -282,12 +338,29 @@ abstract class RiveNative {
     return _initializeCompleter!.future;
   }
 
-  RenderTexture makeRenderTexture();
+  /// Set [deferred] when the caller already knows the texture will be driven
+  /// by a recording session. On web that lets it reuse a canvas the replay
+  /// worker already holds, instead of stranding one worker WebGL context per
+  /// widget lifecycle. Ignored elsewhere.
+  RenderTexture makeRenderTexture({bool deferred = false});
+
+  /// A texture that renders immediately through the headless context and
+  /// reads pixels straight off the GPU, for baking rive content to images.
+  /// Content must decode with [headlessRiveFactory]. Null where the build
+  /// has no headless support (web, flutter runtime libraries).
+  RenderTexture? makeHeadlessRenderTexture() => null;
+
+  /// The factory content must decode with to draw into headless textures;
+  /// null whenever [makeHeadlessRenderTexture] is.
+  Factory? get headlessRiveFactory => null;
 
   /// Releases cached rendering resources retained for reuse. Safe to call
   /// when no Rive content is on screen; resources are recreated on demand.
   /// May be a no-op on platforms that cache nothing.
   void releaseRenderResources() {}
+
+  /// Display pixel ratio for meshed Component rasters. Process-wide.
+  void setRasterDisplayScale(double scale) {}
 
   /// When true, logs render-texture lifecycle events — create, pool reuse,
   /// release and why — to the console, with live WebGL context counts.

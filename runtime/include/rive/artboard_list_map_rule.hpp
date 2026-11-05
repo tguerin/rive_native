@@ -7,7 +7,11 @@ namespace rive
 class ArtboardListMapRule : public ArtboardListMapRuleBase
 {
 public:
-    StatusCode onAddedDirty(CoreContext* context) override;
+  StatusCode onAddedDirty(CoreContext* context) override;
+#ifdef WITH_RIVE_EDITOR
+  void editorParentChanged(ContainerComponent* from, ContainerComponent* to)
+      override;
+#endif
 };
 } // namespace rive
 

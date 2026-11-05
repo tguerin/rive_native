@@ -93,6 +93,49 @@ class WebVertexRenderBuffer extends WebRenderBuffer
   }
 }
 
+class WebImageMeshInstances extends ImageMeshInstances {
+  static final _finalizer = Finalizer(
+    (js.JSAny pointer) =>
+        RiveWasm.deleteImageMeshInstances.callAsFunction(null, pointer),
+  );
+
+  js.JSAny get pointer => _pointer;
+  js.JSAny _pointer;
+
+  WebImageMeshInstances(WebFactory riveFactory, int count)
+      : _pointer = RiveWasm.makeImageMeshInstances.callAsFunction(
+          null,
+          riveFactory.pointer,
+          count.toJS,
+        ) as js.JSAny,
+        super(count) {
+    _finalizer.attach(this, _pointer, detach: this);
+  }
+
+  void update() {
+    final count = instances.length;
+    final address = (RiveWasm.editImageMeshInstances
+            .callAsFunction(null, _pointer, count.toJS) as js.JSNumber)
+        .toDartInt;
+    if (address != 0) {
+      writeTo(
+          RiveWasm.heapViewF32(
+              address,
+              count * ImageMeshInstances.floatsPerInstance,
+          ),
+      );
+    }
+    RiveWasm.endEditImageMeshInstances.callAsFunction(null, _pointer);
+  }
+
+  @override
+  void dispose() {
+    _finalizer.detach(this);
+    RiveWasm.deleteImageMeshInstances.callAsFunction(null, _pointer);
+    _pointer = 0.toJS;
+  }
+}
+
 class WebRenderImage extends RenderImage {
   static final _finalizer = Finalizer(
     (js.JSAny pointer) =>
@@ -710,6 +753,57 @@ class WebRenderPaint extends BufferedRenderPaint {
         RiveWasm.scratchBufferPtr,
         wroteStops.toJS,
       );
+
+  @override
+  bool modulatedArtboard(Renderer renderer, ArtboardPaintSource source,
+      ImageSampler sampler, Mat2D transform) {
+    final apply = RiveWasm.paintModulatedArtboard;
+    final factory = renderer.riveFactory;
+    if (apply == null ||
+        _renderPaint == null ||
+        renderer is! WebRiveRenderer ||
+        factory is! WebFactory ||
+        source is! WebArtboardPaintSource) {
+      return false;
+    }
+    final applied = apply.callAsFunctionEx(
+      null,
+      renderer.jsRendererPtr,
+      factory.pointer,
+      _renderPaint,
+      source.pointer.toJS,
+      sampler.key.toJS,
+      transform[0].toJS,
+      transform[1].toJS,
+      transform[2].toJS,
+      transform[3].toJS,
+      transform[4].toJS,
+      transform[5].toJS,
+    );
+    return applied is js.JSBoolean
+        ? applied.toDart
+        : applied is js.JSNumber && applied.toDartInt != 0;
+  }
+
+  @override
+  void modulatedImage(
+      RenderImage? image, ImageSampler sampler, Mat2D transform) {
+    if (_renderPaint == null) {
+      return;
+    }
+    RiveWasm.paintModulatedImage.callAsFunctionEx(
+      null,
+      _renderPaint,
+      image == null ? 0.toJS : (image as WebRenderImage).pointer,
+      sampler.key.toJS,
+      transform[0].toJS,
+      transform[1].toJS,
+      transform[2].toJS,
+      transform[3].toJS,
+      transform[4].toJS,
+      transform[5].toJS,
+    );
+  }
 }
 
 class WebRiveRenderer extends Renderer {
@@ -723,18 +817,82 @@ class WebRiveRenderer extends Renderer {
   void clipPath(covariant WebRenderPath path) =>
       RiveWasm.clipPath.callAsFunction(null, jsRendererPtr, path.pointer);
 
+  /// Parent renderers of the masks currently open, innermost last. Same trick
+  /// as FFIRiveRenderer: [jsRendererPtr] is swapped to the offscreen renderer
+  /// for the duration, so every existing draw method lands in the right target
+  /// without knowing about masking.
+  final List<js.JSAny?> _maskParents = [];
+
+  @override
+  bool beginMask(MaskMode mode, AABB bounds,
+      {double resolution = 1, int handle = 0}) {
+    final begin = RiveWasm.rendererBeginMask;
+    final factory = riveFactory;
+    if (begin == null || factory is! WebFactory) {
+      return false;
+    }
+    // Null when this renderer cannot mask: no offscreen host (a factory that
+    // is not a recording session) or a device whose blend step has not been
+    // taught the op. The caller then draws the layer unmasked.
+    final canvasRenderer = begin.callAsFunctionEx(
+      null,
+      jsRendererPtr,
+      factory.pointer,
+      _jsBigInt(handle.toJS),
+      mode.index.toJS,
+      bounds[0].toJS,
+      bounds[1].toJS,
+      bounds[2].toJS,
+      bounds[3].toJS,
+      resolution.toJS,
+    );
+    if (canvasRenderer == null ||
+        (canvasRenderer as js.JSNumber).toDartInt == 0) {
+      return false;
+    }
+    _maskParents.add(jsRendererPtr);
+    jsRendererPtr = canvasRenderer;
+    return true;
+  }
+
+  @override
+  void beginMaskSource() {
+    final beginSource = RiveWasm.rendererBeginMaskSource;
+    if (_maskParents.isEmpty || beginSource == null) {
+      return;
+    }
+    final source = beginSource.callAsFunction(null, _maskParents.last);
+    if (source != null && (source as js.JSNumber).toDartInt != 0) {
+      jsRendererPtr = source;
+    }
+  }
+
+  @override
+  void endMask() {
+    if (_maskParents.isEmpty) {
+      return;
+    }
+    final parent = _maskParents.removeLast();
+    RiveWasm.rendererEndMask?.callAsFunction(null, parent);
+    jsRendererPtr = parent;
+  }
+
   @override
   void drawImage(
     covariant WebRenderImage image,
     ui.BlendMode blendMode,
-    double opacity,
-  ) =>
-      RiveWasm.drawImage.callAsFunction(
+    double opacity, {
+    ImageSampler sampler = ImageSampler.linearClamp,
+    double additiveness = 0,
+  }) =>
+      RiveWasm.drawImage.callAsFunctionEx(
         null,
         jsRendererPtr,
         image._pointer,
+        sampler.key.toJS,
         blendMode.index.toJS,
         opacity.toJS,
+        additiveness.toJS,
       );
 
   @override
@@ -744,8 +902,10 @@ class WebRiveRenderer extends Renderer {
     covariant WebVertexRenderBuffer uvs,
     covariant WebIndexRenderBuffer indices,
     ui.BlendMode blendMode,
-    double opacity,
-  ) {
+    double opacity, {
+    ImageSampler sampler = ImageSampler.linearClamp,
+    double additiveness = 0,
+  }) {
     assert(vertices.elementCount == uvs.elementCount);
     RiveWasm.drawImageMesh.callAsFunctionEx(
       null,
@@ -756,8 +916,35 @@ class WebRiveRenderer extends Renderer {
       indices.pointer,
       vertices.elementCount.toJS,
       indices.elementCount.toJS,
+      sampler.key.toJS,
       blendMode.index.toJS,
       opacity.toJS,
+      additiveness.toJS,
+    );
+  }
+
+  @override
+  void drawImageMeshInstanced(
+    covariant WebRenderImage image,
+    covariant WebVertexRenderBuffer vertices,
+    covariant WebVertexRenderBuffer uvs,
+    covariant WebIndexRenderBuffer indices,
+    covariant WebImageMeshInstances instances, {
+    ImageSampler sampler = ImageSampler.linearClamp,
+  }) {
+    assert(vertices.elementCount == uvs.elementCount);
+    instances.update();
+    RiveWasm.drawImageMeshInstanced.callAsFunctionEx(
+      null,
+      jsRendererPtr,
+      image._pointer,
+      vertices.pointer,
+      uvs.pointer,
+      indices.pointer,
+      vertices.elementCount.toJS,
+      indices.elementCount.toJS,
+      sampler.key.toJS,
+      instances.pointer,
     );
   }
 
@@ -1154,6 +1341,50 @@ class WebRawTextInput extends RawTextInput {
       .callAsFunction(null, _rawText, value.index.toJS);
 
   @override
+  TextAlign get align => TextAlign.values.elementAtOrFirst(
+        (RiveWasm.rawTextInputGetAlign.callAsFunction(null, _rawText)
+                as js.JSNumber)
+            .toDartInt,
+      );
+
+  @override
+  set align(TextAlign value) => RiveWasm.rawTextInputSetAlign
+      .callAsFunction(null, _rawText, value.index.toJS);
+
+  @override
+  double get alignWidth =>
+      (RiveWasm.rawTextInputGetAlignWidth.callAsFunction(null, _rawText)
+              as js.JSNumber)
+          .toDartDouble;
+
+  @override
+  set alignWidth(double value) => RiveWasm.rawTextInputSetAlignWidth
+      .callAsFunction(null, _rawText, value.toJS);
+
+  @override
+  VerticalTextAlign get verticalAlign => VerticalTextAlign.values
+          .elementAtOrFirst(
+        (RiveWasm.rawTextInputGetVerticalAlign.callAsFunction(null, _rawText)
+                as js.JSNumber)
+            .toDartInt,
+      );
+
+  @override
+  set verticalAlign(VerticalTextAlign value) => RiveWasm
+      .rawTextInputSetVerticalAlign
+      .callAsFunction(null, _rawText, value.index.toJS);
+
+  @override
+  double get alignHeight =>
+      (RiveWasm.rawTextInputGetAlignHeight.callAsFunction(null, _rawText)
+              as js.JSNumber)
+          .toDartDouble;
+
+  @override
+  set alignHeight(double value) => RiveWasm.rawTextInputSetAlignHeight
+      .callAsFunction(null, _rawText, value.toJS);
+
+  @override
   double get selectionCornerRadius =>
       (RiveWasm.rawTextInputGetSelectionCornerRadius.callAsFunction(
         null,
@@ -1178,6 +1409,50 @@ class WebRawTextInput extends RawTextInput {
   set separateSelectionText(bool value) =>
       RiveWasm.rawTextInputSetSeparateSelectionText
           .callAsFunction(null, _rawText, _boolWasm(value));
+
+  @override
+  bool get obscured => _wasmBool(
+        RiveWasm.rawTextInputGetObscured.callAsFunction(
+          null,
+          _rawText,
+        ),
+      );
+
+  @override
+  set obscured(bool value) => RiveWasm.rawTextInputSetObscured
+      .callAsFunction(null, _rawText, _boolWasm(value));
+
+  // Wasm returns the uint32 as a signed i32.
+  @override
+  int get maxCharacters =>
+      (RiveWasm.rawTextInputGetMaxCharacters.callAsFunction(null, _rawText)
+              as js.JSNumber)
+          .toDartInt
+          .toUnsigned(32);
+
+  @override
+  set maxCharacters(int value) => RiveWasm.rawTextInputSetMaxCharacters
+      .callAsFunction(null, _rawText, value.toJS);
+
+  @override
+  int get maxLines =>
+      (RiveWasm.rawTextInputGetMaxLines.callAsFunction(null, _rawText)
+              as js.JSNumber)
+          .toDartInt
+          .toUnsigned(32);
+
+  @override
+  set maxLines(int value) => RiveWasm.rawTextInputSetMaxLines
+      .callAsFunction(null, _rawText, value.toJS);
+
+  @override
+  bool get hugsWidth => _wasmBool(
+        RiveWasm.rawTextInputGetHugsWidth.callAsFunction(null, _rawText),
+      );
+
+  @override
+  set hugsWidth(bool value) => RiveWasm.rawTextInputSetHugsWidth
+      .callAsFunction(null, _rawText, _boolWasm(value));
 
   @override
   String get text => RiveWasm.toDartString(
@@ -1402,3 +1677,21 @@ class WebRawTextInput extends RawTextInput {
 
 RawTextInput makeRawTextInput(Factory riveFactory) =>
     WebRawTextInput(riveFactory as WebFactory);
+
+/// Global `BigInt` and `Number`: the wasm is built with `-s WASM_BIGINT`, so
+/// the `uint64_t` mask handle crosses the boundary as a BigInt both ways.
+@js.JS('BigInt')
+external js.JSBigInt _jsBigInt(js.JSAny value);
+@js.JS('Number')
+external js.JSNumber _jsNumber(js.JSAny value);
+
+/// A key for one mask's retained offscreen canvases (see
+/// Renderer.acquireMaskHandle). 0 before the module links, which only costs
+/// sharing a canvas pair, not correctness.
+int acquireLayerMaskHandle() {
+  final handle = RiveWasm.rendererAcquireMaskHandle?.callAsFunction(null);
+  return handle == null ? 0 : _jsNumber(handle).toDartInt;
+}
+
+void releaseLayerMaskHandle(int handle) =>
+    RiveWasm.rendererReleaseMask?.callAsFunction(null, _jsBigInt(handle.toJS));

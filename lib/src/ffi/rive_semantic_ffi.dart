@@ -1,3 +1,4 @@
+import 'dart:convert';
 import 'dart:ffi';
 import 'dart:typed_data';
 
@@ -196,7 +197,8 @@ class SemanticsFFI {
   static SemanticsDiff _decodeDiff(Pointer<Void> diffPtrRaw) {
     final nativeDiff = diffPtrRaw.cast<_SemanticsDiffFFI>().ref;
 
-    final removed = _readUint32List(nativeDiff.removed, nativeDiff.removedCount);
+    final removed =
+        _readUint32List(nativeDiff.removed, nativeDiff.removedCount);
     final childrenUpdated = _readChildrenUpdates(
         nativeDiff.childrenUpdated, nativeDiff.childrenUpdatedCount);
 
@@ -255,6 +257,23 @@ class SemanticsFFI {
     }, growable: false);
   }
 
+  /// Decodes a NUL-terminated native UTF-8 string leniently: malformed
+  /// sequences become U+FFFD instead of throwing. A bad label must not
+  /// abort the whole diff decode - the native dirty state is already
+  /// cleared by drain time, so an aborted decode would lose the update
+  /// permanently.
+  @visibleForTesting
+  static String decodeUtf8(Pointer<Utf8> ptr) {
+    if (ptr == nullptr) return '';
+    final units = ptr.cast<Uint8>();
+    var length = 0;
+    while (units[length] != 0) {
+      length++;
+    }
+    if (length == 0) return '';
+    return utf8.decode(units.asTypedList(length), allowMalformed: true);
+  }
+
   static List<SemanticsDiffNode> _readNodes(
       Pointer<_SemanticsDiffNodeFFI> nodesPtr, int count) {
     if (nodesPtr == nullptr || count <= 0) {
@@ -268,9 +287,9 @@ class SemanticsFFI {
       return SemanticsDiffNode(
         id: node.id,
         role: SemanticRole.fromValue(node.role),
-        label: labelPtr == nullptr ? '' : labelPtr.toDartString(),
-        value: valuePtr == nullptr ? '' : valuePtr.toDartString(),
-        hint: hintPtr == nullptr ? '' : hintPtr.toDartString(),
+        label: decodeUtf8(labelPtr),
+        value: decodeUtf8(valuePtr),
+        hint: decodeUtf8(hintPtr),
         stateFlags: node.stateFlags,
         traitFlags: node.traitFlags,
         headingLevel: node.headingLevel,

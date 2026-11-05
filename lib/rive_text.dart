@@ -57,6 +57,20 @@ enum TextAlign { left, right, center }
 
 enum TextWrap { wrap, noWrap }
 
+/// How a word that doesn't fit the line may be split. Mirrors the useful
+/// half of CSS overflow-wrap + word-break, and must stay index identical
+/// with TextWordBreak in the C++ runtime's text_engine.hpp.
+enum TextWordBreak {
+  /// overflow-wrap: break-word. The historical (and default) behavior.
+  breakWord,
+
+  /// overflow-wrap: normal. A word that doesn't fit overflows the box.
+  normal,
+
+  /// word-break: break-all. Cut at any cluster to pack every line.
+  breakAll,
+}
+
 enum VerticalTextAlign { top, bottom, middle }
 
 enum TextSizing {
@@ -408,7 +422,8 @@ abstract class BreakLinesResult extends ListBase<List<GlyphLine>> {
 abstract class TextShapeResult {
   List<Paragraph> get paragraphs;
   void dispose();
-  BreakLinesResult breakLines(double width, TextAlign alignment, TextWrap wrap);
+  BreakLinesResult breakLines(double width, TextAlign alignment, TextWrap wrap,
+      [TextWordBreak wordBreak = TextWordBreak.breakWord]);
 }
 
 /// A representation of a styled section of text in Rive.
@@ -592,6 +607,24 @@ abstract class Font {
     return decodeFont(bytes);
   }
 
+  /// Maps the font at [path] instead of reading it into memory: the pages stay
+  /// clean, file-backed and evictable, and nothing is copied.
+  ///
+  /// Only for trusted, stable local files — system fonts are the intended use.
+  /// The mapping stays live for the returned font's lifetime, and null covers
+  /// **only** failures detected during this call: an unsupported platform (web,
+  /// Windows), a native library predating this export, a missing, unreadable,
+  /// empty or oversized file, or a blob harfbuzz refuses. It says nothing about later access — if the file is
+  /// truncated or its backing storage goes away, faulting a page in raises
+  /// SIGBUS and terminates the process rather than returning an error.
+  ///
+  /// Do not use for user-supplied paths, removable media or network volumes;
+  /// read the bytes and use [decode] instead. Callers must always have a
+  /// [decode] fallback for the platforms that return null.
+  static Font? decodeFile(String path) {
+    return decodeFontFile(path);
+  }
+
   double get ascent;
   double get descent;
 
@@ -737,6 +770,10 @@ abstract class Font {
 abstract class TextHelper {
   double convertStringToNumber(String value);
   double convertIntToNumber(int value);
+
+  /// Formats [value] with a printf-style [spec] exactly like the runtime's
+  /// string template converter. Null when the native library predates it.
+  String? formatTemplateNumber(double value, String spec);
   static TextHelper? init() {
     return initTextHelper();
   }

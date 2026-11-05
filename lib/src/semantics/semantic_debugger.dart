@@ -1,9 +1,13 @@
 import 'dart:math' as math;
 
 import 'package:flutter/foundation.dart';
+// meta's @internal is not re-exported by flutter/foundation.dart at the
+// declared Flutter floor (3.32) - newer SDKs re-export it, making this
+// import look redundant locally.
+// ignore: unnecessary_import
+import 'package:meta/meta.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
-import 'package:meta/meta.dart';
 import 'package:rive_native/rive_native.dart' as rive;
 import 'package:rive_native/semantics.dart';
 
@@ -13,7 +17,6 @@ import 'package:rive_native/semantics.dart';
 ///
 /// Used by [SemanticDebugger]; exposed publicly so custom UIs can build on the
 /// same painter.
-@experimental
 @internal
 base class SemanticDebugPainter extends rive.StateMachinePainter {
   SemanticDebugPainter({
@@ -67,7 +70,6 @@ base class SemanticDebugPainter extends rive.StateMachinePainter {
 
 /// One entry in the debugger log — a captured [SemanticsDiff] with the time
 /// it was emitted and a cached summary.
-@experimental
 @internal
 @immutable
 class SemanticsDiffLogEntry {
@@ -98,7 +100,6 @@ class SemanticsDiffLogEntry {
 
 /// Ring-buffer log of captured [SemanticsDiff]s. Notifies listeners when a
 /// new entry is appended or the log is cleared.
-@experimental
 @internal
 class SemanticsDiffLog extends ChangeNotifier {
   SemanticsDiffLog({this.maxEntries = 200});
@@ -137,7 +138,6 @@ class SemanticsDiffLog extends ChangeNotifier {
 ///   factory: Factory.rive,   // or your factory of choice
 /// )
 /// ```
-@experimental
 @internal
 class SemanticDebugger extends StatefulWidget {
   const SemanticDebugger({
@@ -555,9 +555,9 @@ class _DiffLogTile extends StatelessWidget {
   static String _nodeLine(SemanticsDiffNode n) {
     final label = n.label.isEmpty ? '<no label>' : '"${n.label}"';
     final traits = _decodeFlags(n.traitFlags, _traitNames);
-    final states = _decodeFlags(n.stateFlags, _stateNames);
-    final buf = StringBuffer(
-        'id=${n.id} ${n.role.name} $label parent=${n.parentId}');
+    final states = _decodeStates(n.stateFlags);
+    final buf =
+        StringBuffer('id=${n.id} ${n.role.name} $label parent=${n.parentId}');
     if (traits.isNotEmpty) buf.write(' traits=[$traits]');
     if (states.isNotEmpty) buf.write(' states=[$states]');
     return buf.toString();
@@ -575,7 +575,7 @@ class _DiffLogTile extends StatelessWidget {
       ..write('\n  hint=${_quote(n.hint)}')
       ..write('\n  traits=[${_decodeFlags(n.traitFlags, _traitNames)}]'
           '  traitFlags=0x${n.traitFlags.toRadixString(16)}')
-      ..write('\n  states=[${_decodeFlags(n.stateFlags, _stateNames)}]'
+      ..write('\n  states=[${_decodeStates(n.stateFlags)}]'
           '  stateFlags=0x${n.stateFlags.toRadixString(16)}')
       ..write('\n  headingLevel=${n.headingLevel}')
       ..write('\n  bounds=[${_f(n.minX)},${_f(n.minY)}'
@@ -584,6 +584,24 @@ class _DiffLogTile extends StatelessWidget {
   }
 
   static String _quote(String s) => s.isEmpty ? '""' : '"$s"';
+
+  /// Every state, including the two-bit check field, which [_decodeFlags]
+  /// cannot express. The field holds one of three mutually exclusive values,
+  /// not two independent flags: decoding it bit by bit would report `checked`
+  /// and `mixed` together for a value that carries both bits, a combination
+  /// the field has no meaning for. Decode it once, as a value.
+  static String _decodeStates(int flags) {
+    final parts = <String>[];
+    final flagged = _decodeFlags(flags, _stateNames);
+    if (flagged.isNotEmpty) parts.add(flagged);
+    switch (SemanticState.checkState(flags)) {
+      case SemanticState.checkChecked:
+        parts.add('checked');
+      case SemanticState.checkMixed:
+        parts.add('mixed');
+    }
+    return parts.join(', ');
+  }
 
   static String _decodeFlags(int flags, Map<int, String> names) {
     if (flags == 0) return '';
@@ -607,8 +625,7 @@ class _DiffLogTile extends StatelessWidget {
   static const Map<int, String> _stateNames = {
     SemanticState.expanded: 'expanded',
     SemanticState.selected: 'selected',
-    SemanticState.checked: 'checked',
-    SemanticState.mixed: 'mixed',
+    // Check state is a two-bit field, not a flag -- see _decodeStates.
     SemanticState.toggled: 'toggled',
     SemanticState.required: 'required',
     SemanticState.disabled: 'disabled',

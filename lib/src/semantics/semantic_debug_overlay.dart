@@ -21,7 +21,6 @@ import 'package:rive_native/src/semantics/semantic_tree_model.dart';
 ///   ],
 /// )
 /// ```
-@experimental
 @internal
 class SemanticDebugOverlay extends StatelessWidget {
   const SemanticDebugOverlay({

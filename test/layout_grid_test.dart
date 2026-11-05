@@ -66,6 +66,39 @@ void main() {
     expectLayout(d, 0, 100, 100, 100);
   });
 
+  // The editor's stage tooling draws grid guides from these offsets, and reads
+  // them through whichever binding the platform uses. Asserted here rather than
+  // only in the editor because a binding that returns nothing degrades quietly:
+  // the guides just stop being drawn. Runs on web too via scripts/test_web.sh,
+  // which is the binding that had them missing.
+  test('reports the resolved line offsets along both axes', () {
+    final root = LayoutNode.make();
+    final style = LayoutStyle.make();
+    style.display = LayoutDisplay.grid;
+    style.positionType = LayoutPosition.absolute;
+    style.setGridTracks(LayoutGridCollection.templateColumns, const [
+      LayoutGridTrack.points(100),
+      LayoutGridTrack.points(100),
+      LayoutGridTrack.points(100),
+    ]);
+    style.setGridTracks(LayoutGridCollection.templateRows, const [
+      LayoutGridTrack.points(50),
+      LayoutGridTrack.points(50),
+    ]);
+    root.setStyle(style);
+
+    makeChild(root, 0);
+    makeChild(root, 1);
+    makeChild(root, 2);
+    makeChild(root, 3);
+
+    root.calculateLayout(double.nan, double.nan, LayoutDirection.ltr);
+
+    // One more line than tracks: both edges of the grid are lines.
+    expect(root.gridColumnLineOffsets, [0, 100, 200, 300]);
+    expect(root.gridRowLineOffsets, [0, 50, 100]);
+  });
+
   test('fr tracks distribute free space after fixed tracks and gaps', () {
     final root = LayoutNode.make();
     final style = LayoutStyle.make();
@@ -162,5 +195,31 @@ void main() {
     root.calculateLayout(double.nan, double.nan, LayoutDirection.ltr);
 
     expectLayout(item, 30, 40, 40, 20);
+  });
+
+  test('virtual contributions size tracks for items with no node', () {
+    final root = LayoutNode.make();
+    final style = LayoutStyle.make();
+    style.display = LayoutDisplay.grid;
+    style.positionType = LayoutPosition.absolute;
+    style.setGridTracks(LayoutGridCollection.templateColumns, const [
+      LayoutGridTrack.auto(),
+      LayoutGridTrack.auto(),
+    ]);
+    root.setStyle(style);
+    // One realized item; the contributions stand for every item.
+    makeChild(root, 0, width: 40, height: 30);
+
+    expect(root.setGridVirtualContributions([30, 50, 20], [40, 70]), isTrue);
+    // The same contributions again change nothing.
+    expect(root.setGridVirtualContributions([30, 50, 20], [40, 70]), isFalse);
+    root.calculateLayout(double.nan, double.nan, LayoutDirection.ltr);
+    expect(root.gridRowLineOffsets, [0, 30, 80, 100]);
+    expect(root.gridColumnLineOffsets, [0, 40, 110]);
+    expectLayout(root, 0, 0, 110, 100);
+
+    expect(root.setGridVirtualContributions(const [], const []), isTrue);
+    root.calculateLayout(double.nan, double.nan, LayoutDirection.ltr);
+    expectLayout(root, 0, 0, 40, 30);
   });
 }

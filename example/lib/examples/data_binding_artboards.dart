@@ -21,7 +21,7 @@ class _ExampleBasicState extends State<ExampleDataBindingArtboards> {
   rive.BindableArtboard? artboardRed;
   rive.BindableArtboard? artboardBlue;
   rive.BindableArtboard? artboardGreen;
-  late rive.ViewModelInstance viewModelInstance;
+  late rive.BindableViewModelInstance viewModelInstance;
   late rive.ViewModelInstanceArtboard artboard1Property;
   late rive.ViewModelInstanceArtboard artboard2Property;
 

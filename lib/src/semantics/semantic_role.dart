@@ -1,6 +1,5 @@
 import 'package:meta/meta.dart';
 
-@experimental
 @internal
 enum SemanticRole {
   none(0),

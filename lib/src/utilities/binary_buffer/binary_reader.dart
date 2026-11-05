@@ -99,6 +99,10 @@ class BinaryReader {
       // correctly for integers up to 2^53.
       double multiplier = 1;
       while (true) {
+        if (isEOF) {
+          throw RangeError('Unexpected end of buffer while reading VarUint '
+              '(readIndex: $readIndex, length: ${buffer.lengthInBytes})');
+        }
         int byte = buffer.getUint8(readIndex++) & 0xff;
         result += ((byte & 0x7f) * multiplier).toInt();
         if ((byte & 0x80) == 0) break;
@@ -107,6 +111,10 @@ class BinaryReader {
     } else {
       int shift = 0;
       while (true) {
+        if (isEOF) {
+          throw RangeError('Unexpected end of buffer while reading VarUint '
+              '(readIndex: $readIndex, length: ${buffer.lengthInBytes})');
+        }
         int byte = buffer.getUint8(readIndex++) & 0xff;
         result |= (byte & 0x7f) << shift;
         if ((byte & 0x80) == 0) break;
@@ -124,21 +132,9 @@ class BinaryReader {
     if (length == 0) {
       return '';
     }
-    late Uint8List bytes;
-    if (kIsWeb) {
-      // This is to workaround SharedArrayBuffer no longer working with methods
-      // like Uint8List.view. Details here:
-      // https://dart-review.googlesource.com/c/sdk/+/343940/12/sdk/lib/js_interop/js_interop.dart
-      // and here https://github.com/dart-lang/sdk/issues/56455
-      bytes = Uint8List(length);
-      for (int index = 0; index < length; index++) {
-        bytes[index] = buffer.getUint8(readIndex++);
-      }
-    } else {
-      bytes = Uint8List.view(
-          buffer.buffer, buffer.offsetInBytes + readIndex, length);
-      readIndex += length;
-    }
+    Uint8List bytes =
+        Uint8List.view(buffer.buffer, buffer.offsetInBytes + readIndex, length);
+    readIndex += length;
     return _utf8Decoder.convert(bytes);
   }
 
@@ -154,17 +150,9 @@ class BinaryReader {
       _utf8DecoderLossy.convert(read(length, false));
 
   Uint8List read(int length, [bool allocNew = true]) {
-    if (kIsWeb) {
-      final bytes = Uint8List(length);
-      for (int index = 0; index < length; index++) {
-        bytes[index] = buffer.getUint8(readIndex++);
-      }
-      return bytes; // always new
-    } else {
-      final bytes = Uint8List.view(
-          buffer.buffer, buffer.offsetInBytes + readIndex, length);
-      readIndex += length;
-      return allocNew ? Uint8List.fromList(bytes) : bytes;
-    }
+    final bytes =
+        Uint8List.view(buffer.buffer, buffer.offsetInBytes + readIndex, length);
+    readIndex += length;
+    return allocNew ? Uint8List.fromList(bytes) : bytes;
   }
 }

@@ -35,6 +35,8 @@ late js.JSFunction _disposeFocusManager;
 late js.JSFunction _focusManagerGetPrimaryFocus;
 late js.JSFunction _focusManagerSetFocus;
 late js.JSFunction _focusManagerClearFocus;
+late js.JSFunction _focusManagerPressBegan;
+late js.JSFunction _focusManagerPressEnded;
 late js.JSFunction _focusManagerHasFocus;
 late js.JSFunction _focusManagerHasPrimaryFocus;
 late js.JSFunction _focusManagerAddChild;
@@ -48,11 +50,18 @@ late js.JSFunction _focusManagerFocusUp;
 late js.JSFunction _focusManagerFocusDown;
 late js.JSFunction _focusManagerKeyInput;
 late js.JSFunction _focusManagerTextInput;
+js.JSFunction? _focusManagerSelectedText;
+js.JSFunction? _focusManagerPrimaryFocusAcceptsText;
 // These require WITH_RIVE_TOOLS (editor builds only via EMSCRIPTEN_BINDINGS)
 js.JSFunction? _focusManagerGetPrimaryFocusBounds;
 late js.JSFunction _focusManagerGetPrimaryFocusArtboard;
 late js.JSFunction _focusManagerGetPrimaryFocusImmediateArtboard;
 late js.JSFunction _focusManagerIsFocusInArtboard;
+late js.JSFunction _focusManagerRequestFocus;
+late js.JSFunction _focusManagerRequestClearFocus;
+late js.JSFunction _focusManagerRequestTraversal;
+late js.JSFunction _focusManagerProcessAllPendingFocusRequests;
+late js.JSFunction _focusManagerFinishAllPendingFocusRequests;
 late js.JSFunction _dropFocusIfFocusTargetHidden;
 js.JSFunction? _focusManagerSetFocusChangedCallback;
 js.JSFunction? _focusManagerSetScrollIntoViewCallback;
@@ -337,6 +346,17 @@ class NativeFocusManagerWasmWrapper implements focus.FocusManager {
   }
 
   @override
+  void pressBegan() {
+    _focusManagerPressBegan.callAsFunction(null, nativePtr.toJS);
+  }
+
+  @override
+  void pressEnded(double x, double y) {
+    _focusManagerPressEnded.callAsFunction(
+        null, nativePtr.toJS, x.toJS, y.toJS);
+  }
+
+  @override
   void clearFocus() {
     _focusManagerClearFocus.callAsFunction(null, nativePtr.toJS);
   }
@@ -451,6 +471,29 @@ class NativeFocusManagerWasmWrapper implements focus.FocusManager {
   }
 
   @override
+  String selectedText() {
+    final fn = _focusManagerSelectedText;
+    if (fn == null) {
+      return '';
+    }
+    final pointer =
+        (fn.callAsFunction(null, nativePtr.toJS) as js.JSNumber).toDartInt;
+    if (pointer == 0) {
+      return '';
+    }
+    return RiveWasm.toDartString(pointer, deleteNative: true);
+  }
+
+  @override
+  bool primaryFocusAcceptsText() {
+    final fn = _focusManagerPrimaryFocusAcceptsText;
+    if (fn == null) {
+      return false;
+    }
+    return _wasmBool(fn.callAsFunction(null, nativePtr.toJS));
+  }
+
+  @override
   ({double minX, double minY, double maxX, double maxY})? primaryFocusBounds() {
     final fn = _focusManagerGetPrimaryFocusBounds;
     if (fn == null) return null;
@@ -498,6 +541,48 @@ class NativeFocusManagerWasmWrapper implements focus.FocusManager {
       nativePtr.toJS,
       artboardPtr.toJS,
     ));
+  }
+
+  @override
+  void requestFocus(focus.FocusNode node) {
+    final nodePtr = _getNodePointer(node);
+    if (nodePtr != null) {
+      _focusManagerRequestFocus.callAsFunction(
+        null,
+        nativePtr.toJS,
+        nodePtr.toJS,
+      );
+    }
+  }
+
+  @override
+  void requestClearFocus() {
+    _focusManagerRequestClearFocus.callAsFunction(null, nativePtr.toJS);
+  }
+
+  @override
+  void requestTraversal(int traversalKind) {
+    _focusManagerRequestTraversal.callAsFunction(
+      null,
+      nativePtr.toJS,
+      traversalKind.toJS,
+    );
+  }
+
+  @override
+  void processAllPendingFocusRequests() {
+    _focusManagerProcessAllPendingFocusRequests.callAsFunction(
+      null,
+      nativePtr.toJS,
+    );
+  }
+
+  @override
+  void finishAllPendingFocusRequests() {
+    _focusManagerFinishAllPendingFocusRequests.callAsFunction(
+      null,
+      nativePtr.toJS,
+    );
   }
 
   @override
@@ -596,6 +681,17 @@ class FocusManagerWasm implements focus.FocusManager {
   }
 
   @override
+  void pressBegan() {
+    _focusManagerPressBegan.callAsFunction(null, nativePtr.toJS);
+  }
+
+  @override
+  void pressEnded(double x, double y) {
+    _focusManagerPressEnded.callAsFunction(
+        null, nativePtr.toJS, x.toJS, y.toJS);
+  }
+
+  @override
   void clearFocus() {
     _focusManagerClearFocus.callAsFunction(null, nativePtr.toJS);
   }
@@ -710,6 +806,29 @@ class FocusManagerWasm implements focus.FocusManager {
   }
 
   @override
+  String selectedText() {
+    final fn = _focusManagerSelectedText;
+    if (fn == null) {
+      return '';
+    }
+    final pointer =
+        (fn.callAsFunction(null, nativePtr.toJS) as js.JSNumber).toDartInt;
+    if (pointer == 0) {
+      return '';
+    }
+    return RiveWasm.toDartString(pointer, deleteNative: true);
+  }
+
+  @override
+  bool primaryFocusAcceptsText() {
+    final fn = _focusManagerPrimaryFocusAcceptsText;
+    if (fn == null) {
+      return false;
+    }
+    return _wasmBool(fn.callAsFunction(null, nativePtr.toJS));
+  }
+
+  @override
   ({double minX, double minY, double maxX, double maxY})? primaryFocusBounds() {
     final fn = _focusManagerGetPrimaryFocusBounds;
     if (fn == null) return null;
@@ -757,6 +876,48 @@ class FocusManagerWasm implements focus.FocusManager {
       nativePtr.toJS,
       artboardPtr.toJS,
     ));
+  }
+
+  @override
+  void requestFocus(focus.FocusNode node) {
+    final nodePtr = _getNodePointer(node);
+    if (nodePtr != null) {
+      _focusManagerRequestFocus.callAsFunction(
+        null,
+        nativePtr.toJS,
+        nodePtr.toJS,
+      );
+    }
+  }
+
+  @override
+  void requestClearFocus() {
+    _focusManagerRequestClearFocus.callAsFunction(null, nativePtr.toJS);
+  }
+
+  @override
+  void requestTraversal(int traversalKind) {
+    _focusManagerRequestTraversal.callAsFunction(
+      null,
+      nativePtr.toJS,
+      traversalKind.toJS,
+    );
+  }
+
+  @override
+  void processAllPendingFocusRequests() {
+    _focusManagerProcessAllPendingFocusRequests.callAsFunction(
+      null,
+      nativePtr.toJS,
+    );
+  }
+
+  @override
+  void finishAllPendingFocusRequests() {
+    _focusManagerFinishAllPendingFocusRequests.callAsFunction(
+      null,
+      nativePtr.toJS,
+    );
   }
 
   @override
@@ -812,6 +973,10 @@ class FocusManagerWasm implements focus.FocusManager {
     _focusManagerSetFocus = module['_focusManagerSetFocus'] as js.JSFunction;
     _focusManagerClearFocus =
         module['_focusManagerClearFocus'] as js.JSFunction;
+    _focusManagerPressBegan =
+        module['_focusManagerPressBegan'] as js.JSFunction;
+    _focusManagerPressEnded =
+        module['_focusManagerPressEnded'] as js.JSFunction;
     _focusManagerHasFocus = module['_focusManagerHasFocus'] as js.JSFunction;
     _focusManagerHasPrimaryFocus =
         module['_focusManagerHasPrimaryFocus'] as js.JSFunction;
@@ -830,6 +995,10 @@ class FocusManagerWasm implements focus.FocusManager {
     _focusManagerFocusDown = module['_focusManagerFocusDown'] as js.JSFunction;
     _focusManagerKeyInput = module['_focusManagerKeyInput'] as js.JSFunction;
     _focusManagerTextInput = module['_focusManagerTextInput'] as js.JSFunction;
+    _focusManagerSelectedText =
+        module['_focusManagerSelectedText'] as js.JSFunction?;
+    _focusManagerPrimaryFocusAcceptsText =
+        module['_focusManagerPrimaryFocusAcceptsText'] as js.JSFunction?;
     _focusManagerGetPrimaryFocusArtboard =
         module['_focusManagerGetPrimaryFocusArtboard'] as js.JSFunction;
     _focusManagerGetPrimaryFocusImmediateArtboard =
@@ -837,6 +1006,16 @@ class FocusManagerWasm implements focus.FocusManager {
             as js.JSFunction;
     _focusManagerIsFocusInArtboard =
         module['_focusManagerIsFocusInArtboard'] as js.JSFunction;
+    _focusManagerRequestFocus =
+        module['_focusManagerRequestFocus'] as js.JSFunction;
+    _focusManagerRequestClearFocus =
+        module['_focusManagerRequestClearFocus'] as js.JSFunction;
+    _focusManagerRequestTraversal =
+        module['_focusManagerRequestTraversal'] as js.JSFunction;
+    _focusManagerProcessAllPendingFocusRequests =
+        module['_focusManagerProcessAllPendingFocusRequests'] as js.JSFunction;
+    _focusManagerFinishAllPendingFocusRequests =
+        module['_focusManagerFinishAllPendingFocusRequests'] as js.JSFunction;
     _dropFocusIfFocusTargetHidden =
         module['_dropFocusIfFocusTargetHidden'] as js.JSFunction;
 

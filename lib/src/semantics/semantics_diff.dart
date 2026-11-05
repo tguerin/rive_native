@@ -2,7 +2,6 @@ import 'package:meta/meta.dart';
 
 import 'semantic_role.dart';
 
-@experimental
 @internal
 class SemanticsDiffNode {
   final int id;
@@ -35,7 +34,6 @@ class SemanticsDiffNode {
   });
 }
 
-@experimental
 @internal
 class SemanticsChildrenUpdate {
   final int parentId;
@@ -47,7 +45,6 @@ class SemanticsChildrenUpdate {
   });
 }
 
-@experimental
 @internal
 class SemanticsBoundsUpdate {
   final int id;
@@ -84,7 +81,6 @@ class SemanticsBoundsUpdate {
 /// A minimal adapter can therefore process the lists in the order declared by
 /// [SemanticsDiff] fields (removed → added → moved → childrenUpdated →
 /// updatedSemantic → updatedGeometry) and, within each list, iterate linearly.
-@experimental
 @internal
 class SemanticsDiff {
   final int treeVersion;

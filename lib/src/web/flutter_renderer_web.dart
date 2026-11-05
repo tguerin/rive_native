@@ -14,7 +14,9 @@ import 'package:rive_native/src/web/rive_renderer_web.dart';
 import 'package:rive_native/src/web/rive_web.dart';
 import 'package:rive_native/src/rive.dart' as rive;
 
-class FlutterRendererWeb extends WebRiveRenderer implements FlutterRenderer {
+class FlutterRendererWeb extends WebRiveRenderer
+    with FlutterMaskRenderer
+    implements FlutterRenderer {
   @override
   final ui.Canvas canvas;
 
@@ -86,7 +88,10 @@ class WebFlutterFactory extends WebFactory {
   static final _indexBufferLookup = HashMap<js.JSBigInt, Uint16List>();
   static get canvasLookup => _canvasLookup;
 
-  static final List<WebFlutterFactoryImage> _loadingImages = [];
+  /// Images decoded while a file loads, which that file decode waits for.
+  /// Null outside a load so unrelated decodes are not awaited, see
+  /// https://github.com/rive-app/rive-flutter/issues/658.
+  static List<WebFlutterFactoryImage>? _loadingImages;
   static final images = HashMap<js.JSBigInt, WebFlutterFactoryImage>();
 
   @override
@@ -94,7 +99,7 @@ class WebFlutterFactory extends WebFactory {
     final image = RiveWasm.makeFlutterRenderImage.callAsFunction(null, pointer);
     final imagePtr = (image as js.JSNumber).toDartInt;
     var flutterImage = WebFlutterFactoryImage();
-    WebFlutterFactory._loadingImages.add(flutterImage);
+    WebFlutterFactory._loadingImages?.add(flutterImage);
     var id = RiveWasm.flutterRenderImageId.callAsFunction(null, image)
         as js.JSBigInt;
     images[id] = flutterImage;
@@ -117,7 +122,7 @@ class WebFlutterFactory extends WebFactory {
   static void _decodeRenderImageFromNative(
       int imagePtr, js.JSBigInt id, int dataPtr, int dataSize) {
     var flutterImage = WebFlutterFactoryImage();
-    WebFlutterFactory._loadingImages.add(flutterImage);
+    WebFlutterFactory._loadingImages?.add(flutterImage);
     images[id] = flutterImage;
     var bytesList = Uint8List.fromList(RiveWasm.heap(dataPtr, dataSize));
     ui.decodeImageFromList(
@@ -149,8 +154,24 @@ class WebFlutterFactory extends WebFactory {
     }
   }
 
+  static ui.FilterQuality _filterQuality(ImageSampler sampler) =>
+      sampler.filter == ImageSamplerFilter.nearest
+          ? ui.FilterQuality.none
+          : ui.FilterQuality.high;
+
+  static ui.TileMode _tileMode(ImageSamplerWrap wrap) {
+    switch (wrap) {
+      case ImageSamplerWrap.repeat:
+        return ui.TileMode.repeated;
+      case ImageSamplerWrap.mirror:
+        return ui.TileMode.mirror;
+      case ImageSamplerWrap.clamp:
+        return ui.TileMode.clamp;
+    }
+  }
+
   static void _drawRenderImage(int rendererPtr, js.JSBigInt imageId,
-      int blendModeValue, double opacity) {
+      int samplerKey, int blendModeValue, double opacity) {
     var image = WebFlutterFactory.images[imageId];
 
     var uiCanvas = _canvasLookup[rendererPtr]?.target;
@@ -162,7 +183,7 @@ class WebFlutterFactory extends WebFactory {
         ui.Offset.zero,
         ui.Paint()
           ..blendMode = ui.BlendMode.values[blendModeValue]
-          ..filterQuality = ui.FilterQuality.high
+          ..filterQuality = _filterQuality(ImageSampler.fromKey(samplerKey))
           ..color = ui.Color.fromRGBO(255, 255, 255, opacity),
       );
     }
@@ -176,6 +197,7 @@ class WebFlutterFactory extends WebFactory {
       js.JSBigInt indexBufferPtr,
       int vertexCount,
       int indexCount,
+      int samplerKey,
       int blendModeValue,
       double opacity) {
     var image = WebFlutterFactory.images[imagePtr];
@@ -195,17 +217,18 @@ class WebFlutterFactory extends WebFactory {
     var uiCanvas = _canvasLookup[rendererPtr]?.target;
     var uiImage = image?.image;
     if (uiImage != null && uiCanvas != null) {
+      var sampler = ImageSampler.fromKey(samplerKey);
       uiCanvas.drawVertices(
         drawVertices,
         ui.BlendMode.srcOver,
         ui.Paint()
           ..blendMode = ui.BlendMode.values[blendModeValue]
           ..color = ui.Color.fromRGBO(255, 255, 255, opacity)
-          ..filterQuality = ui.FilterQuality.high
+          ..filterQuality = _filterQuality(sampler)
           ..shader = ui.ImageShader(
             uiImage,
-            ui.TileMode.clamp,
-            ui.TileMode.clamp,
+            _tileMode(sampler.wrapX),
+            _tileMode(sampler.wrapY),
             Float64List.fromList(
               <double>[
                 1 / uiImage.width,
@@ -356,6 +379,19 @@ class WebFlutterFactory extends WebFactory {
 
     if ((dirt & (PaintDirtFromNative.linear | PaintDirtFromNative.radial)) !=
         0) {
+      var xx = reader.readFloat32();
+      var xy = reader.readFloat32();
+      var yx = reader.readFloat32();
+      var yy = reader.readFloat32();
+      var tx = reader.readFloat32();
+      var ty = reader.readFloat32();
+      var gradientTransform = Float64List.fromList([
+        xx, xy, 0, 0,
+        yx, yy, 0, 0,
+        0, 0, 1, 0,
+        tx, ty, 0, 1,
+      ]);
+
       var stopCount = reader.readUint32();
       List<double> stops = [];
       List<ui.Color> colors = [];
@@ -370,7 +406,13 @@ class WebFlutterFactory extends WebFactory {
         var centerY = reader.readFloat32();
         var radius = reader.readFloat32();
         uiPaint.shader = ui.Gradient.radial(
-            ui.Offset(centerX, centerY), radius, colors, stops);
+          ui.Offset(centerX, centerY),
+          radius,
+          colors,
+          stops,
+          ui.TileMode.clamp,
+          gradientTransform,
+        );
       } else {
         var sx = reader.readFloat32();
         var sy = reader.readFloat32();
@@ -382,6 +424,8 @@ class WebFlutterFactory extends WebFactory {
           ui.Offset(ex, ey),
           colors,
           stops,
+          ui.TileMode.clamp,
+          gradientTransform,
         );
       }
     } else if ((dirt & PaintDirtFromNative.removeGradient) != 0) {
@@ -435,12 +479,15 @@ class WebFlutterFactory extends WebFactory {
   }
 
   @override
+  void startedDecodingFile() => _loadingImages = [];
+
+  @override
   Future<void> completedDecodingFile(bool success) async {
-    if (success) {
+    final loading = _loadingImages;
+    _loadingImages = null;
+    if (success && loading != null) {
       // these images belong to the RiveFile loaded, so wait for them to load before
       // completing the load.
-      var loading = List<WebFlutterFactoryImage>.from(_loadingImages);
-      _loadingImages.clear();
       for (final image in loading) {
         var completer = image.completer;
         if (completer != null) {

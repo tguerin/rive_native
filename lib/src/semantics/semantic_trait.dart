@@ -9,7 +9,6 @@ import 'package:meta/meta.dart';
 /// Example: a button with the [expandable] trait can be expanded or
 /// collapsed. Without the trait the expanded state bit is ignored by the
 /// platform accessibility layer.
-@experimental
 @internal
 abstract final class SemanticTrait {
   /// Node can be expanded / collapsed (disclosure).

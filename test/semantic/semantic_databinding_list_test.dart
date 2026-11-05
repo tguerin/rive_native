@@ -3,7 +3,7 @@ import 'package:flutter/semantics.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:rive_native/rive_native.dart' as rive;
 import 'package:rive_native/semantics.dart';
-import 'package:rive_native/src/semantics/rive_semantics_test_helpers.dart';
+import 'rive_semantics_test_helpers.dart';
 
 import '../src/utils.dart';
 

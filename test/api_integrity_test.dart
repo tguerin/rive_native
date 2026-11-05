@@ -783,6 +783,123 @@ void main() {
     expect(debugFileCount(), 0);
   });
 
+  test('global read-back wrappers are canonical and released with the machine',
+      () async {
+    expect(debugFileCount(), 0);
+    final bytes = loadFile('assets/global_view_models_test.riv');
+    var riveFile =
+        await rive.File.decode(bytes, riveFactory: rive.Factory.flutter);
+    final artboard = riveFile!.defaultArtboard();
+    final stateMachine = artboard!.defaultStateMachine();
+    expect(debugFileCount(), 1);
+
+    // bind() auto-creates core instances for the main and every global,
+    // but no Dart wrappers exist until a slot is read back: every canonical
+    // wrapper mints lazily on first read.
+    stateMachine!.bind();
+    expect(debugViewModelInstanceRuntimeCount(), 0);
+    final main = stateMachine.boundRuntimeViewModelInstance;
+    expect(main, isNotNull);
+    expect(debugViewModelInstanceRuntimeCount(), 1);
+    expect(identical(stateMachine.boundRuntimeViewModelInstance, main),
+        isTrue);
+    expect(debugViewModelInstanceRuntimeCount(), 1);
+
+    // First read of a global mints one wrapper; repeat reads return the same
+    // object without minting another.
+    final colors = stateMachine.globalViewModelInstance('Colors');
+    expect(colors, isNotNull);
+    expect(debugViewModelInstanceRuntimeCount(), 2);
+    expect(identical(stateMachine.globalViewModelInstance('Colors'), colors),
+        isTrue);
+    expect(debugViewModelInstanceRuntimeCount(), 2);
+
+    // Minted wrappers belong to the machine's canonical registry and are
+    // released with it (runtime-owned views live and die with the machine).
+    stateMachine.dispose();
+    expect(debugViewModelInstanceRuntimeCount(), 0);
+    expect(colors!.isDisposed, isTrue);
+    expect(main!.isDisposed, isTrue);
+
+    artboard.dispose();
+    riveFile.dispose();
+    expect(debugFileCount(), 0);
+  });
+
+  test('a staged binding survives its Dart wrapper', () async {
+    expect(debugFileCount(), 0);
+    final bytes = loadFile('assets/global_view_models_test.riv');
+    var riveFile =
+        await rive.File.decode(bytes, riveFactory: rive.Factory.flutter);
+    final artboard = riveFile!.defaultArtboard();
+    final stateMachine = artboard!.defaultStateMachine();
+
+    final mine = makeDefaultInstance(riveFile, 'Sizes');
+    expect(debugViewModelInstanceRuntimeCount(), 1);
+    expect(stateMachine!.setGlobalViewModelInstance('Sizes', mine), isTrue);
+    stateMachine.bind(); // wrappers only mint on read-back
+
+    final gaps = mine.number('gaps');
+    gaps!.value = 24;
+    gaps.dispose();
+
+    // The caller owns this wrapper and may dispose it early: core holds its
+    // own ref to the staged instance, so the binding is unaffected.
+    mine.dispose();
+    expect(debugViewModelInstanceRuntimeCount(), 0);
+
+    // Reading the slot back mints a fresh wrapper over the same core
+    // instance - the staged value is still there.
+    final readBack = stateMachine.globalViewModelInstance('Sizes')!;
+    expect(identical(readBack, mine), isFalse);
+    expect(debugViewModelInstanceRuntimeCount(), 1);
+    final gapsAgain = readBack.number('gaps');
+    expect(gapsAgain!.value, 24);
+    gapsAgain.dispose();
+
+    stateMachine.dispose();
+    expect(debugViewModelInstanceRuntimeCount(), 0);
+    artboard.dispose();
+    riveFile.dispose();
+    expect(debugFileCount(), 0);
+  });
+
+  test('a user-created global instance outlives machine, artboard and file',
+      () async {
+    expect(debugFileCount(), 0);
+    final bytes = loadFile('assets/global_view_models_test.riv');
+    var riveFile =
+        await rive.File.decode(bytes, riveFactory: rive.Factory.flutter);
+    final artboard = riveFile!.defaultArtboard();
+    final stateMachine = artboard!.defaultStateMachine();
+
+    final mine = makeDefaultInstance(riveFile, 'Sizes');
+    expect(debugViewModelInstanceRuntimeCount(), 1);
+    expect(stateMachine!.setGlobalViewModelInstance('Sizes', mine), isTrue);
+    stateMachine.bind(); // wrappers only mint on read-back
+    expect(debugViewModelInstanceRuntimeCount(), 1);
+
+    final gaps = mine.number('gaps');
+    gaps!.value = 7;
+    gaps.dispose();
+
+    // Every runtime owner goes away; the user-created instance is theirs and
+    // must stay untouched and fully functional, without pinning the file.
+    stateMachine.dispose();
+    artboard.dispose();
+    riveFile.dispose();
+    expect(debugFileCount(), 0);
+    expect(mine.isDisposed, isFalse);
+    expect(debugViewModelInstanceRuntimeCount(), 1);
+
+    final gapsAgain = mine.number('gaps');
+    expect(gapsAgain!.value, 7);
+    gapsAgain.dispose();
+
+    mine.dispose();
+    expect(debugViewModelInstanceRuntimeCount(), 0);
+  });
+
   test('file and artboard live on with text runs referenced', () async {
     expect(debugFileCount(), 0);
     expect(debugArtboardCount(), 0);

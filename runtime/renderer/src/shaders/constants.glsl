@@ -5,6 +5,59 @@
 #define TESS_TEXTURE_WIDTH float(2048)
 #define TESS_TEXTURE_WIDTH_LOG2 11
 
+// # of tessellation segments spanned by each patch type. Kept in sync with
+// gpu::kMidpointFanPatchSegmentSpan and gpu::OuterCubicPatchSegmentSpan (see
+// the static_asserts in gpu.cpp).
+#define MIDPOINT_FAN_PATCH_SEGMENT_SPAN 8u
+#define OUTER_CUBIC_PATCH_SEGMENT_SPAN 16u
+// An outer cubic's tessellation stride also covers its trailing zero-length
+// bowtie-join segment. (gpu::OuterCubicPatchSegmentSpanPlusBowtie.)
+#define OUTER_CUBIC_PATCH_SEGMENT_SPAN_PLUS_BOWTIE                             \
+  (OUTER_CUBIC_PATCH_SEGMENT_SPAN + 1u)
+
+// depthStencil draws use repeating index patterns instead of instancing.
+// Per-patch vertex IDs are aligned on pow2 strides, specifically so the
+// shader can decode gl_VertexID without divides and mods. (Using integer
+// division costs 10% total framerate on PowerVR and 3% on Adreno.)
+// NOTE: The patches don't actually have pow2 numbers of vertices; the index
+// buffers just never reference those vertex IDs between the end of one patch
+// and the beginning of another.
+#define DS_MIDPOINT_FAN_STRIDE_LOG2 4
+#define DS_OUTER_CUBIC_STRIDE_LOG2 5
+#define DS_FILL_PATCH_STRIDE_LOG2(IS_OUTER_CUBIC)                              \
+  ((IS_OUTER_CUBIC) ? DS_OUTER_CUBIC_STRIDE_LOG2 : DS_MIDPOINT_FAN_STRIDE_LOG2)
+#define DS_FILL_PATCH_STRIDE(IS_OUTER_CUBIC)                                   \
+  (1 << DS_FILL_PATCH_STRIDE_LOG2(IS_OUTER_CUBIC))
+#define DS_STROKE_STRIDE_LOG2 5
+#define DS_AA_STROKE_STRIDE_LOG2 6
+#define DS_STROKE_PATCH_STRIDE_LOG2(IS_AA_STROKE)                              \
+  ((IS_AA_STROKE) ? DS_AA_STROKE_STRIDE_LOG2 : DS_STROKE_STRIDE_LOG2)
+#define DS_STROKE_PATCH_STRIDE(IS_AA_STROKE)                                   \
+  (1 << DS_STROKE_PATCH_STRIDE_LOG2(IS_AA_STROKE))
+// Normal strokes are a single triangle strip with 2 lanes of vertices (top,
+// bottom).
+// AA strokes have an AA band on top and bottom, making 4 lanes of vertices and
+// 3 bands of triangle strips (top AA ramp, body, bottom AA ramp).
+#define DS_STROKE_LANES_PER_SPOKE_LOG2(IS_AA_STROKE) ((IS_AA_STROKE) ? 2 : 1)
+
+// One vertex of the midpointFan pattern is reserved for the contour's midpoint
+// rather than tessellation points.
+#define DS_MIDPOINT_VERTEX_IDX (int(MIDPOINT_FAN_PATCH_SEGMENT_SPAN) + 1)
+
+// depthStencil draws encode some attributes as flags on gl_VertexID, in order
+// to avoid input attribs.
+// NOTE: vertexIDs are 16-bit in the index buffer, but they get offset per draw
+// into the tessellation texture. So these flags have to live above the entire
+// tessellation range. Hence a shift of 28 and not 16.
+#define VERTEX_FLAGS_SHIFT 28
+#define VERTEX_FLAG_DISABLE_COLOR_WRITE (0x1 << VERTEX_FLAGS_SHIFT)
+#define VERTEX_FLAG_OUTER_CUBIC_FILL (0x2 << VERTEX_FLAGS_SHIFT)
+// Strokes alias the outerCubic bit bc stroke vs. fill is decided by spec const.
+#define VERTEX_FLAG_AA_POLAR_STROKE VERTEX_FLAG_OUTER_CUBIC_FILL
+// depthAAstrokes render in two passes: a depth-only pass followed by color.
+// We select the pass by vertex flags rather than pipeline state.
+#define VERTEX_FLAG_STROKE_DEPTH_PASS (0x4 << VERTEX_FLAGS_SHIFT)
+
 #define GRAD_TEXTURE_WIDTH float(512)
 #define GRAD_TEXTURE_INVERSE_WIDTH float(0.001953125)
 
@@ -27,7 +80,7 @@
 // Amount to increase "joinSegmentCount" in a feather join so the number of
 // literal vertices allocated increases by FEATHER_JOIN_HELPER_VERTEX_COUNT.
 #define FEATHER_JOIN_HELPER_SEGMENT_COUNT                                      \
-    (FEATHER_JOIN_HELPER_VERTEX_COUNT + 1u)
+  (FEATHER_JOIN_HELPER_VERTEX_COUNT + 1u)
 
 // Feather joins are split into a backward and forward section. Both sections
 // need at least one segment, thus a minimum of 2 (plus helper vertices).
@@ -39,12 +92,13 @@
 // Width to use for a texture that emulates a storage buffer.
 //
 // Minimize width since the texture needs to be updated in entire rows from the
-// resource buffer. Since these only serve paths and contours, both of those are
-// limited to 16-bit indices, 2048 is the min specified texture size in ES3, and
-// no path buffer uses more than 4 texels, we can safely use a width of 128.
-#define STORAGE_TEXTURE_WIDTH 128
-#define STORAGE_TEXTURE_SHIFT_Y 7
-#define STORAGE_TEXTURE_MASK_X 0x7fu
+// resource buffer. The paintAuxBuffer is the bottleneck here, it is large
+// enough that we need a width of 256 for all of the values to sit within the
+// minimum-required texture height of 2048. If not for that, a width of 128
+// would be sufficient (as paths and contours just store 16-bit indices).
+#define STORAGE_TEXTURE_WIDTH 256
+#define STORAGE_TEXTURE_SHIFT_Y 8
+#define STORAGE_TEXTURE_MASK_X 0xffu
 
 // Flags that state whether/how we need to render solid-color borders to the
 // left and/or right side of a GradientSpan. (Borders of complex gradients
@@ -55,14 +109,14 @@
 #define GRAD_SPAN_FLAG_RIGHT_BORDER 0x40000000u
 #define GRAD_SPAN_FLAG_COMPLEX_BORDER 0x20000000u
 #define GRAD_SPAN_FLAGS_MASK                                                   \
-    (GRAD_SPAN_FLAG_LEFT_BORDER | GRAD_SPAN_FLAG_RIGHT_BORDER |                \
-     GRAD_SPAN_FLAG_COMPLEX_BORDER)
+  (GRAD_SPAN_FLAG_LEFT_BORDER | GRAD_SPAN_FLAG_RIGHT_BORDER |                  \
+   GRAD_SPAN_FLAG_COMPLEX_BORDER)
 
-// Tells shaders that a cubic should actually be drawn as the single, non-AA
-// triangle: [p0, p1, p3]. This is used to squeeze in more rare triangles, like
-// "grout" triangles from self intersections on interior triangulation, where it
-// wouldn't be worth it to put them in their own dedicated draw call.
-#define RETROFITTED_TRIANGLE_CONTOUR_FLAG (1u << 31u)
+// Tells shaders that a cubic should actually be drawn as a non-AA triangle
+// strip of up to 5 points: [p0, p1, p3, p2, joinTangent]. This is used to
+// reduce draws and pipeline transitions by squeezing in triangles that don't
+// otherwise need special state or shading logic.
+#define RETROFIT_TRI_STRIP_CONTOUR_FLAG (1u << 31u)
 
 // Skip bit 30 in the contour flags so that it's always 0. This ensures we never
 // generate special NaN/Inf floating point values in contourIDWithFlags, which
@@ -77,10 +131,11 @@
 
 // Flags for specifying the join type.
 #define JOIN_TYPE_MASK (7u << 26u)
-#define MITER_CLIP_JOIN_CONTOUR_FLAG (5u << 26u)
-#define MITER_REVERT_JOIN_CONTOUR_FLAG (4u << 26u)
-#define BEVEL_JOIN_CONTOUR_FLAG (3u << 26u)
-#define ROUND_JOIN_CONTOUR_FLAG (2u << 26u)
+#define MITER_CLIP_JOIN_CONTOUR_FLAG (6u << 26u)
+#define MITER_REVERT_JOIN_CONTOUR_FLAG (5u << 26u)
+#define BEVEL_JOIN_CONTOUR_FLAG (4u << 26u)
+#define ROUND_JOIN_CONTOUR_FLAG (3u << 26u)
+#define CUSP_JOIN_CONTOUR_FLAG (2u << 26u)
 #define FEATHER_JOIN_CONTOUR_FLAG (1u << 26u)
 
 // When a join is being used to emulate a stroke cap, the shader emits
@@ -121,12 +176,26 @@
 #define SOLID_COLOR_PAINT_TYPE 1u
 #define LINEAR_GRADIENT_PAINT_TYPE 2u
 #define RADIAL_GRADIENT_PAINT_TYPE 3u
-#define IMAGE_PAINT_TYPE 4u
+#define ANGULAR_GRADIENT_PAINT_TYPE 4u
 
 // Paint flags, found in the x-component value of @paintBuffer.
 #define PAINT_FLAG_NON_ZERO_FILL 0x100u
 #define PAINT_FLAG_EVEN_ODD_FILL 0x200u
 #define PAINT_FLAG_HAS_CLIP_RECT 0x400u
+#define PAINT_FLAG_HAS_IMAGE 0x800u
+// A layer-mask apply: the sampled image is coverage, not color, and the blend
+// step multiplies the destination by a factor derived from it. Bits 13-14 hold
+// which factor (rive::LayerMaskMode). Bits 12-15 of paintData.x were free; 8-11
+// are the flags above and 16-31 are the clipID.
+#define PAINT_FLAG_LAYER_MASK 0x1000u
+#define PAINT_LAYER_MASK_MODE_SHIFT 13u
+#define PAINT_LAYER_MASK_MODE_MASK 0x6000u
+
+// rive::LayerMaskMode
+#define LAYER_MASK_MODE_ALPHA 0u
+#define LAYER_MASK_MODE_INVERTED_ALPHA 1u
+#define LAYER_MASK_MODE_LUMINANCE 2u
+#define LAYER_MASK_MODE_INVERTED_LUMINANCE 3u
 
 // PLS draw resources are either updated per flush or per draw. They go into set
 // 0 or set 1, depending on how often they are updated.
@@ -189,25 +258,37 @@
 #define COALESCED_ATOMIC_RESOLVE_IDX SCRATCH_COLOR_PLANE_IDX
 
 // Index of each instanced attribute for image draws.
+// First, the common attributes:
 #define IMAGE_FIRST_ATTRIB_IDX 2
 #define IMAGE_VIEW_MATRIX_ATTRIB_IDX 2
 #define IMAGE_CLIP_RECT_INVERSE_MATRIX_ATTRIB_IDX 3
 #define IMAGE_TRANSLATES_ATTRIB_IDX 4
-#define IMAGE_PACKED_ATTRIBS_IDX 5
-#define IMAGE_LAST_ATTRIB_IDX 5
-#define IMAGE_ATTRIB_COUNT (IMAGE_LAST_ATTRIB_IDX + 1 - IMAGE_FIRST_ATTRIB_IDX)
+#define IMAGE_MODULATED_COLOR_ATTRIB_IDX 5
+#define IMAGE_CLIP_ID_ATTRIB_IDX 6
+#define IMAGE_BLEND_MODE_ATTRIB_IDX 7
+#define IMAGE_ZINDEX_ATTRIB_IDX 8
 
-// When SPLIT_UINT4_ATTRIBUTES is set (Unreal RHI, whose shader compiler
-// mishandles a uint4 vertex attribute), the packed uint4 is bound as four
-// separate uint attributes at these consecutive locations.
-#define IMAGE_SPLIT_OPACITY_ATTRIB_IDX 5
-#define IMAGE_SPLIT_CLIP_ID_ATTRIB_IDX 6
-#define IMAGE_SPLIT_BLEND_MODE_ATTRIB_IDX 7
-#define IMAGE_SPLIT_ZINDEX_ATTRIB_IDX 8
+#define IMAGE_COMMON_LAST_ATTRIB_IDX 8
+#define IMAGE_COMMON_ATTRIB_COUNT                                              \
+  (IMAGE_COMMON_LAST_ATTRIB_IDX + 1 - IMAGE_FIRST_ATTRIB_IDX)
 
-// MSAA attaches different resources to the framebuffer instead of PLS planes.
-#define MSAA_DEPTH_STENCIL_IDX 1u
-#define MSAA_RESOLVE_IDX 2u
+#define IMAGE_RECT_IMAGE_MATRIX_ATTRIB_IDX 9
+#define IMAGE_RECT_GRADIENT_MATRIX_ATTRIB_IDX 10
+#define IMAGE_RECT_IMAGE_AND_GRADIENT_TRANSLATES_ATTRIB_IDX 11
+#define IMAGE_RECT_PACKED_GRADIENT_DATA 12
+#define IMAGE_RECT_LAST_ATTRIB_IDX IMAGE_RECT_PACKED_GRADIENT_DATA
+#define IMAGE_RECT_ATTRIB_COUNT                                                \
+  (IMAGE_RECT_LAST_ATTRIB_IDX + 1 - IMAGE_FIRST_ATTRIB_IDX)
+
+#define IMAGE_MESH_UV_TRANSFORM_ATTRIB_IDX 9
+#define IMAGE_MESH_LAST_ATTRIB_IDX IMAGE_MESH_UV_TRANSFORM_ATTRIB_IDX
+#define IMAGE_MESH_ATTRIB_COUNT                                                \
+  (IMAGE_MESH_LAST_ATTRIB_IDX + 1 - IMAGE_FIRST_ATTRIB_IDX)
+
+// depthStencil mode attaches different resources to the framebuffer than PLS
+// planes.
+#define DEPTH_STENCIL_BUFFER_IDX 1u
+#define DEPTH_STENCIL_FINAL_COLOR_IDX 2u
 #define MSAA_COLOR_SEED_IDX 3u
 
 // Rive has a hard-coded miter limit of 4 in the editor and all runtimes.
@@ -243,6 +324,16 @@
 #define BLEND_MODE_SATURATION 13u
 #define BLEND_MODE_COLOR 14u
 #define BLEND_MODE_LUMINOSITY 15u
+
+// Rive's depth buffer is a packed 23-bit integer:
+//
+//   bits [22:8] : path zIndex (larger == on top, depth-tested with GREATER)
+//   bits [7:0]  : coverage
+//
+// Coverage sits below the zIndex, so the depth test resolves zIndex first and
+// max coverage second, for free.
+#define DEPTH_Z_INDEX_BIT_COUNT 15u
+#define DEPTH_COVERAGE_BIT_COUNT 8u
 
 // Fixed-point coverage values for atomic mode.
 // Atomic mode uses 6:11 fixed point, so the winding number breaks if a shape
@@ -288,17 +379,21 @@
 #define CLIP_RECT_SPECIALIZATION_IDX 1
 #define ADVANCED_BLEND_SPECIALIZATION_IDX 2
 #define FEATHER_SPECIALIZATION_IDX 3
-#define EVEN_ODD_SPECIALIZATION_IDX 4
-#define NESTED_CLIPPING_SPECIALIZATION_IDX 5
-#define HSL_BLEND_MODES_SPECIALIZATION_IDX 6
-#define DITHER_SPECIALIZATION_IDX 7
-#define CLOCKWISE_FILL_SPECIALIZATION_IDX 8
-#define NESTED_CLIP_UPDATE_ONLY_IDX 9
-#define BORROWED_COVERAGE_PASS_SPECIALIZATION_IDX 10
-#define STORE_COLOR_CLEAR_SPECIALIZATION_IDX 11
-#define LOAD_COLOR_FROM_DST_TEXTURE_SPECIALIZATION_IDX 12
-#define VULKAN_VENDOR_ARM_SPECIALIZATION_IDX 13
-#define SPECIALIZATION_COUNT 14
+#define MODULATED_IMAGE_SPECIALIZATION_IDX 4
+#define EVEN_ODD_SPECIALIZATION_IDX 5
+#define NESTED_CLIPPING_SPECIALIZATION_IDX 6
+#define HSL_BLEND_MODES_SPECIALIZATION_IDX 7
+#define DITHER_SPECIALIZATION_IDX 8
+#define ANGULAR_GRADIENT_SPECIALIZATION_IDX 9
+#define CLOCKWISE_FILL_SPECIALIZATION_IDX 10
+#define NESTED_CLIP_UPDATE_ONLY_SPECIALIZATION_IDX 11
+#define BORROWED_COVERAGE_PASS_SPECIALIZATION_IDX 12
+#define STORE_COLOR_CLEAR_SPECIALIZATION_IDX 13
+#define LOAD_COLOR_FROM_DST_TEXTURE_SPECIALIZATION_IDX 14
+#define VULKAN_VENDOR_ARM_SPECIALIZATION_IDX 15
+#define DS_POLAR_STROKE_SPECIALIZATION_IDX 16
+#define DS_HAIRLINE_STROKE_SPECIALIZATION_IDX 17
+#define SPECIALIZATION_COUNT 18
 
 // When rendering to an r32i feather atlas, use 16:16 fixed point.
 #define ATLAS_R32I_FIXED_POINT_FACTOR 65536.
@@ -315,8 +410,12 @@
 // both width and height.
 #define BUFFER_IMAGE_TILE_SIZE 32u
 #define BUFFER_IMAGE_TILE_SIZE_LOG2 5u
+
+// The paint aux data has a specific number of float32x4 elements in it
+#define PAINT_AUX_ENTRY_ELEMENT_COUNT 8u
+
 #ifdef __cplusplus
-#if __cplusplus >= 201703
+  #if __cplusplus >= 201703
 static_assert(BUFFER_IMAGE_TILE_SIZE == 1u << BUFFER_IMAGE_TILE_SIZE_LOG2);
-#endif
+  #endif
 #endif

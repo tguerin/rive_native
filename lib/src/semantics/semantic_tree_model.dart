@@ -1,10 +1,13 @@
 import 'package:flutter/foundation.dart';
+// meta's @internal is not re-exported by flutter/foundation.dart at the
+// declared Flutter floor (3.32) - newer SDKs re-export it, making this
+// import look redundant locally.
+// ignore: unnecessary_import
 import 'package:meta/meta.dart';
 import 'package:rive_native/src/semantics/semantic_role.dart';
 import 'package:rive_native/src/semantics/semantics_diff.dart';
 
 /// A single node in the semantic tree.
-@experimental
 @internal
 class SemanticNodeData {
   final int id;
@@ -42,7 +45,6 @@ class SemanticNodeData {
 
 /// Maintains an in-memory semantic tree built from incremental [SemanticsDiff]
 /// updates. Notifies listeners whenever [applyDiff] changes the tree.
-@experimental
 @internal
 class SemanticTreeModel extends ChangeNotifier {
   final Map<int, SemanticNodeData> _nodesById = {};
@@ -91,14 +93,27 @@ class SemanticTreeModel extends ChangeNotifier {
     }
   }
 
-  void _removeSubtree(int id) {
+  // Removal is per-id, matching the native contract: the diff's removed
+  // list names every removed node individually (tree pre-order). A child
+  // that survives its parent's removal is NOT listed - it arrives in the
+  // same diff's moved entries, so removing recursively here would destroy
+  // it before the moved handler runs.
+  void _removeNode(int id) {
     final node = _nodesById[id];
     if (node == null) return;
-    for (final child in List<int>.from(node.children)) {
-      _removeSubtree(child);
-    }
     _detach(id);
     _nodesById.remove(id);
+  }
+
+  /// Remove every node and notify listeners. The next applied diff rebuilds
+  /// the tree from scratch. Keeps the model instance (and its listeners)
+  /// alive, unlike dispose-and-recreate.
+  void clear() {
+    if (_nodesById.isEmpty && _roots.isEmpty) return;
+    _nodesById.clear();
+    _roots.clear();
+    _version++;
+    notifyListeners();
   }
 
   /// Apply an incremental diff to the tree and notify listeners if anything
@@ -113,7 +128,7 @@ class SemanticTreeModel extends ChangeNotifier {
 
     for (final id in diff.removed) {
       if (_nodesById.containsKey(id)) {
-        _removeSubtree(id);
+        _removeNode(id);
         changed = true;
       }
     }

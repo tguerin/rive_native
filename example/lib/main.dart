@@ -77,6 +77,7 @@ class _HomePageState extends State<HomePage> {
     Demo(const SemanticDemoRiveDatabindingLists(),
         "Semantic Rive Databinding Lists"),
     Demo(const ExampleBasic(), "Basic"),
+    Demo(const ExampleDeferred(), "Deferred Rendering"),
     Demo(const StabilityTest(), "Stability Test"),
     Demo(const ExampleDataBinding(), "Data Binding - Basics"),
     Demo(const ExampleDataBindingArtboards(), "Data Binding - Artboards"),

@@ -219,6 +219,22 @@ void main() {
       node.dispose();
     });
 
+    test('selectedText is empty without a focused text element', () {
+      final manager = FocusManager.make();
+      final node = FocusNode.make();
+      manager.addChild(null, node);
+
+      // No focus at all.
+      expect(manager.selectedText(), isEmpty);
+
+      // Focused, but a Dart callback node holds no text selection.
+      manager.setFocus(node);
+      expect(manager.selectedText(), isEmpty);
+
+      manager.dispose();
+      node.dispose();
+    });
+
     test('removeChild clears focus', () {
       final manager = FocusManager.make();
       final node = FocusNode.make();

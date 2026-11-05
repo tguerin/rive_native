@@ -76,6 +76,20 @@ abstract class BufferedRenderPaint extends RenderPaint {
     _dirty |= PaintDirt.feather;
   }
 
+  double _additiveness = 0.0;
+
+  @override
+  double get additiveness => _additiveness;
+
+  @override
+  set additiveness(double value) {
+    if (_additiveness == value) {
+      return;
+    }
+    _additiveness = value;
+    _dirty |= PaintDirt.additiveness;
+  }
+
   ui.StrokeJoin _join = ui.StrokeJoin.miter;
 
   @override
@@ -104,6 +118,20 @@ abstract class BufferedRenderPaint extends RenderPaint {
     _dirty |= PaintDirt.cap;
   }
 
+  StrokePosition _strokePosition = StrokePosition.center;
+
+  @override
+  StrokePosition get strokePosition => _strokePosition;
+
+  @override
+  set strokePosition(StrokePosition value) {
+    if (_strokePosition == value) {
+      return;
+    }
+    _strokePosition = value;
+    _dirty |= PaintDirt.strokePosition;
+  }
+
   RenderGradient? _gradient;
 
   @override
@@ -116,6 +144,20 @@ abstract class BufferedRenderPaint extends RenderPaint {
     }
     _gradient = gradient;
     _dirty |= PaintDirt.gradient;
+  }
+
+  Mat2D _gradientTransform = Mat2D();
+
+  @override
+  Mat2D get gradientTransform => _gradientTransform;
+
+  @override
+  set gradientTransform(Mat2D value) {
+    if (Mat2D.areEqual(_gradientTransform, value)) {
+      return;
+    }
+    _gradientTransform = Mat2D.clone(value);
+    _dirty |= PaintDirt.gradientTransform;
   }
 
   ByteData get scratchBufferByteData;
@@ -151,15 +193,38 @@ abstract class BufferedRenderPaint extends RenderPaint {
     if ((_dirty & PaintDirt.blendMode) != 0) {
       view.setUint8(offset++, _blendMode.index);
     }
+    if ((_dirty & PaintDirt.strokePosition) != 0) {
+      view.setUint8(offset++, _strokePosition.index);
+    }
 
+    if ((_dirty & PaintDirt.gradientTransform) != 0) {
+      for (int i = 0; i < 6; i++) {
+        view.setFloat32(offset, _gradientTransform[i], Endian.little);
+        offset += 4;
+      }
+    }
+    if ((_dirty & PaintDirt.feather) != 0) {
+      view.setFloat32(offset, _feather, Endian.little);
+      offset += 4;
+    }
+    if ((_dirty & PaintDirt.additiveness) != 0) {
+      view.setFloat32(offset, _additiveness, Endian.little);
+      offset += 4;
+    }
+
+    // We write gradient stops last because they are the only thing which may
+    // run out of buffer space and require flushing.
     int wroteStops = 0;
     if (_gradient != null) {
       var gradient = _gradient!;
       var isRadial = gradient is RenderRadialGradient;
+      var isAngular = gradient is RenderAngularGradient;
       int writeStopIndex = 0;
       while (true) {
         if (isRadial) {
           _dirty |= PaintDirt.radial;
+        } else if (isAngular) {
+          _dirty |= PaintDirt.angular;
         }
 
         var remaining = view.lengthInBytes - offset - 16;
@@ -189,10 +254,14 @@ abstract class BufferedRenderPaint extends RenderPaint {
             view.setFloat32(offset, gradient.radius, Endian.little);
             offset += 4;
           } else {
-            var linear = gradient as RenderLinearGradient;
-            view.setFloat32(offset, linear.end.x, Endian.little);
+            // A sweep writes the linear payload, so the reader consumes the
+            // same bytes whichever of the two it is.
+            final end = isAngular
+                ? gradient.end
+                : (gradient as RenderLinearGradient).end;
+            view.setFloat32(offset, end.x, Endian.little);
             offset += 4;
-            view.setFloat32(offset, linear.end.y, Endian.little);
+            view.setFloat32(offset, end.y, Endian.little);
             offset += 4;
           }
           // Stop looping, we've built the gradient.
@@ -206,12 +275,10 @@ abstract class BufferedRenderPaint extends RenderPaint {
           offset = 0;
         }
       }
+    } else if ((_dirty & PaintDirt.gradient) != 0) {
+      wroteStops = removeGradientStops;
     }
 
-    if ((_dirty & PaintDirt.feather) != 0) {
-      view.setFloat32(offset, _feather, Endian.little);
-      offset += 4;
-    }
     updatePaint(_dirty, wroteStops);
     _dirty = 0;
   }

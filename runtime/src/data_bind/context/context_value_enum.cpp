@@ -1,48 +1,60 @@
 #include "rive/data_bind/context/context_value_enum.hpp"
 #include "rive/data_bind/data_values/data_value_enum.hpp"
 #include "rive/generated/core_registry.hpp"
+#include "rive/scripted/scripted_transition.hpp"
 
 using namespace rive;
 
-DataBindContextValueEnum::DataBindContextValueEnum(DataBind* dataBind) :
-    DataBindContextValue(dataBind)
+DataBindContextValueEnum::DataBindContextValueEnum(DataBind* dataBind)
+    : DataBindContextValue(dataBind)
 {}
 
-void DataBindContextValueEnum::apply(Core* target,
-                                     uint32_t propertyKey,
-                                     bool isMainDirection,
-                                     DataBind* dataBind)
+void DataBindContextValueEnum::apply(
+    Core* target,
+    uint32_t propertyKey,
+    bool isMainDirection,
+    DataBind* dataBind)
 {
 
-    syncSourceValue(dataBind);
-    auto value = calculateValue<DataValueEnum, uint32_t>(m_dataValue,
-                                                         isMainDirection,
-                                                         dataBind);
-    switch (CoreRegistry::propertyFieldId(propertyKey))
+  syncSourceValue(dataBind);
+  auto value = calculateValue<DataValueEnum, uint32_t>(
+      m_dataValue,
+      isMainDirection,
+      dataBind);
+  switch (CoreRegistry::propertyFieldId(propertyKey))
+  {
+    case CoreUintType::id:
     {
-        case CoreUintType::id:
+      if (target && (target->is<Solo>() || target->is<ScriptedTransition>()))
+      {
+        // Select by the enum item's NAME: its id is meaningless as a
+        // child id.
+        if (m_dataValue->is<DataValueEnum>())
         {
-            if (target && target->is<Solo>())
+          auto dataValueEnum = m_dataValue->as<DataValueEnum>();
+          auto dataEnum = dataValueEnum->dataEnum();
+          if (dataEnum)
+          {
+            auto valueString = dataEnum->value(value);
+            if (target->is<Solo>())
             {
-                if (m_dataValue->is<DataValueEnum>())
-                {
-                    auto dataValueEnum = m_dataValue->as<DataValueEnum>();
-                    auto dataEnum = dataValueEnum->dataEnum();
-                    if (dataEnum)
-                    {
-                        auto valueString = dataEnum->value(value);
-                        target->as<Solo>()->updateByName(valueString);
-                    }
-                }
+              target->as<Solo>()->updateByName(valueString);
             }
             else
             {
-                CoreRegistry::setUint(target, propertyKey, value);
+              target->as<ScriptedTransition>()->updateByName(valueString);
             }
-            break;
+          }
         }
-        default:
-            CoreRegistry::setUint(target, propertyKey, value);
-            break;
+      }
+      else
+      {
+        CoreRegistry::setUint(target, propertyKey, value);
+      }
+      break;
     }
+    default:
+      CoreRegistry::setUint(target, propertyKey, value);
+      break;
+  }
 }

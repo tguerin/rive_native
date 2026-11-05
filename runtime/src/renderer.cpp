@@ -1,128 +1,195 @@
 #include "rive/math/mat2d.hpp"
 #include "rive/renderer.hpp"
-#include "rive/text_engine.hpp"
 
 using namespace rive;
 
-Mat2D rive::computeAlignment(Fit fit,
-                             Alignment alignment,
-                             const AABB& frame,
-                             const AABB& content,
-                             const float scaleFactor)
+Mat2D rive::computeAlignment(
+    Fit fit,
+    Alignment alignment,
+    const AABB& frame,
+    const AABB& content,
+    const float scaleFactor)
 {
-    float contentWidth = content.width();
-    float contentHeight = content.height();
-    float x = -content.left() - contentWidth * 0.5f -
-              (alignment.x() * contentWidth * 0.5f);
-    float y = -content.top() - contentHeight * 0.5f -
-              (alignment.y() * contentHeight * 0.5f);
+  float contentWidth = content.width();
+  float contentHeight = content.height();
+  float x = -content.left() - contentWidth * 0.5f -
+            (alignment.x() * contentWidth * 0.5f);
+  float y = -content.top() - contentHeight * 0.5f -
+            (alignment.y() * contentHeight * 0.5f);
 
-    float scaleX = 1.0f, scaleY = 1.0f;
+  float scaleX = 1.0f, scaleY = 1.0f;
 
-    switch (fit)
+  switch (fit)
+  {
+    case Fit::fill:
     {
-        case Fit::fill:
-        {
-            scaleX = frame.width() / contentWidth;
-            scaleY = frame.height() / contentHeight;
-            break;
-        }
-        case Fit::contain:
-        {
-            float minScale = std::fmin(frame.width() / contentWidth,
-                                       frame.height() / contentHeight);
-            scaleX = scaleY = minScale;
-            break;
-        }
-        case Fit::cover:
-        {
-            float maxScale = std::fmax(frame.width() / contentWidth,
-                                       frame.height() / contentHeight);
-            scaleX = scaleY = maxScale;
-            break;
-        }
-        case Fit::fitHeight:
-        {
-            float minScale = frame.height() / contentHeight;
-            scaleX = scaleY = minScale;
-            break;
-        }
-        case Fit::fitWidth:
-        {
-            float minScale = frame.width() / contentWidth;
-            scaleX = scaleY = minScale;
-            break;
-        }
-        case Fit::layout:
-        {
-            scaleX = scaleY = scaleFactor;
-            break;
-        }
-        case Fit::none:
-        {
-            scaleX = scaleY = 1.0f;
-            break;
-        }
-        case Fit::scaleDown:
-        {
-            float minScale = std::fmin(frame.width() / contentWidth,
-                                       frame.height() / contentHeight);
-            scaleX = scaleY = minScale < 1.0f ? minScale : 1.0f;
-            break;
-        }
+      scaleX = frame.width() / contentWidth;
+      scaleY = frame.height() / contentHeight;
+      break;
     }
+    case Fit::contain:
+    {
+      float minScale = std::fmin(
+          frame.width() / contentWidth,
+          frame.height() / contentHeight);
+      scaleX = scaleY = minScale;
+      break;
+    }
+    case Fit::cover:
+    {
+      float maxScale = std::fmax(
+          frame.width() / contentWidth,
+          frame.height() / contentHeight);
+      scaleX = scaleY = maxScale;
+      break;
+    }
+    case Fit::fitHeight:
+    {
+      float minScale = frame.height() / contentHeight;
+      scaleX = scaleY = minScale;
+      break;
+    }
+    case Fit::fitWidth:
+    {
+      float minScale = frame.width() / contentWidth;
+      scaleX = scaleY = minScale;
+      break;
+    }
+    case Fit::layout:
+    {
+      scaleX = scaleY = scaleFactor;
+      break;
+    }
+    case Fit::none:
+    {
+      scaleX = scaleY = 1.0f;
+      break;
+    }
+    case Fit::scaleDown:
+    {
+      float minScale = std::fmin(
+          frame.width() / contentWidth,
+          frame.height() / contentHeight);
+      scaleX = scaleY = minScale < 1.0f ? minScale : 1.0f;
+      break;
+    }
+  }
 
-    Mat2D translation;
-    translation[4] = frame.left() + frame.width() * 0.5f +
-                     (alignment.x() * frame.width() * 0.5f);
-    translation[5] = frame.top() + frame.height() * 0.5f +
-                     (alignment.y() * frame.height() * 0.5f);
+  Mat2D translation;
+  translation[4] = frame.left() + frame.width() * 0.5f +
+                   (alignment.x() * frame.width() * 0.5f);
+  translation[5] = frame.top() + frame.height() * 0.5f +
+                   (alignment.y() * frame.height() * 0.5f);
 
-    return translation * Mat2D::fromScale(scaleX, scaleY) *
-           Mat2D::fromTranslate(x, y);
+  return translation * Mat2D::fromScale(scaleX, scaleY) *
+         Mat2D::fromTranslate(x, y);
 }
 
 void Renderer::translate(float tx, float ty)
 {
-    this->transform(Mat2D(1, 0, 0, 1, tx, ty));
+  this->transform(Mat2D(1, 0, 0, 1, tx, ty));
 }
 
 void Renderer::scale(float sx, float sy)
 {
-    this->transform(Mat2D(sx, 0, 0, sy, 0, 0));
+  this->transform(Mat2D(sx, 0, 0, sy, 0, 0));
 }
 
 void Renderer::rotate(float radians)
 {
-    const float s = std::sin(radians);
-    const float c = std::cos(radians);
-    this->transform(Mat2D(c, s, -s, c, 0, 0));
+  const float s = std::sin(radians);
+  const float c = std::cos(radians);
+  this->transform(Mat2D(c, s, -s, c, 0, 0));
 }
 
-RenderBuffer::RenderBuffer(RenderBufferType type,
-                           RenderBufferFlags flags,
-                           size_t sizeInBytes) :
-    m_type(type), m_flags(flags), m_sizeInBytes(sizeInBytes)
+RenderBuffer::RenderBuffer(
+    RenderBufferType type,
+    RenderBufferFlags flags,
+    size_t sizeInBytes)
+    : m_type(type)
+    , m_flags(flags)
+    , m_sizeInBytes(sizeInBytes)
 {}
 
 RenderBuffer::~RenderBuffer() {}
 
 void* RenderBuffer::map()
 {
-    assert(m_mapCount == 0 ||
-           !enums::is_flag_set(m_flags,
-                               RenderBufferFlags::mappedOnceAtInitialization));
-    assert(m_mapCount == m_unmapCount);
-    RIVE_DEBUG_CODE(++m_mapCount;)
-    m_dirty = true;
-    return onMap();
+  assert(
+      m_mapCount == 0 || !enums::is_flag_set(
+                             m_flags,
+                             RenderBufferFlags::mappedOnceAtInitialization));
+  assert(m_mapCount == m_unmapCount);
+  RIVE_DEBUG_CODE(++m_mapCount;)
+  m_dirty = true;
+  return onMap();
 }
 
 void RenderBuffer::unmap()
 {
-    assert(m_unmapCount + 1 == m_mapCount);
-    RIVE_DEBUG_CODE(++m_unmapCount;)
-    onUnmap();
+  assert(m_unmapCount + 1 == m_mapCount);
+  RIVE_DEBUG_CODE(++m_unmapCount;)
+  onUnmap();
+}
+
+ImageMeshInstances::ImageMeshInstances(size_t count) : m_instanceData(count) {}
+
+ImageMeshInstances::~ImageMeshInstances() {}
+
+Span<ImageMeshInstanceData> ImageMeshInstances::edit()
+{
+  assert(m_editCount == m_endEditCount);
+  RIVE_DEBUG_CODE(++m_editCount;)
+  return m_instanceData;
+}
+
+Span<ImageMeshInstanceData> ImageMeshInstances::edit(size_t count)
+{
+  m_instanceData.resize(count);
+  return edit();
+}
+
+void ImageMeshInstances::endEdit()
+{
+  assert(m_endEditCount + 1 == m_editCount);
+  RIVE_DEBUG_CODE(++m_endEditCount;)
+  onEndEdit();
+}
+
+void Renderer::drawImageMeshInstanced(
+    const RenderImage* image,
+    ImageSampler sampler,
+    rcp<RenderBuffer> vertices_f32,
+    rcp<RenderBuffer> uvCoords_f32,
+    rcp<RenderBuffer> indices_u16,
+    uint32_t vertexCount,
+    uint32_t indexCount,
+    rcp<ImageMeshInstances> instances)
+{
+  if (instances == nullptr)
+  {
+    return;
+  }
+
+  // The default implementation just delegates to drawImageMesh.
+  // TODO(ben) Add UV transform support to drawImageMesh
+  for (const ImageMeshInstanceData& instance : instances->instanceData())
+  {
+    save();
+    transform(instance.transform);
+    drawImageMesh(
+        image,
+        sampler,
+        vertices_f32,
+        uvCoords_f32,
+        indices_u16,
+        vertexCount,
+        indexCount,
+        BlendMode::srcOver,
+        instance.opacity,
+        instance.additiveness);
+    restore();
+  }
 }
 
 RenderShader::RenderShader() {}
@@ -139,96 +206,9 @@ RenderImage::~RenderImage() {}
 RenderPath::RenderPath() {}
 RenderPath::~RenderPath() {}
 
-bool rive::isWhiteSpace(Unichar c)
+void RenderPath::addUntrustedRawPath(const RawPath& path)
 {
-    // 0x2028 is a Line separator.
-    // 0x200B is a Zero width space.
-    return c <= ' ' || c == 0x2028 || c == 0x200B;
-}
-
-SimpleArray<Paragraph> Font::shapeText(Span<const Unichar> text,
-                                       Span<const TextRun> runs,
-                                       int textDirectionFlag) const
-{
-#ifdef DEBUG
-    size_t count = 0;
-    for (const TextRun& tr : runs)
-    {
-        assert(tr.unicharCount > 0);
-        count += tr.unicharCount;
-    }
-    assert(count <= text.size());
-#endif
-
-    SimpleArray<Paragraph> paragraphs =
-        onShapeText(text, runs, textDirectionFlag);
-    bool wantWhiteSpace = false;
-    GlyphRun* lastRun = nullptr;
-    size_t reserveSize = text.size() / 4;
-    SimpleArrayBuilder<uint32_t> breakBuilder(reserveSize);
-    SimpleArrayBuilder<uint32_t> joinerBuilder(reserveSize);
-    for (const Paragraph& para : paragraphs)
-    {
-        for (GlyphRun& gr : para.runs)
-        {
-            if (lastRun != nullptr)
-            {
-                lastRun->breaks = std::move(breakBuilder);
-                lastRun->joiners = std::move(joinerBuilder);
-                // Reset the builder.
-                breakBuilder = SimpleArrayBuilder<uint32_t>(reserveSize);
-                joinerBuilder = SimpleArrayBuilder<uint32_t>(reserveSize);
-            }
-            uint32_t glyphIndex = 0;
-            for (uint32_t offset : gr.textIndices)
-            {
-                Unichar unicode = text[offset];
-                if (unicode == '\n' || unicode == 0x2028)
-                {
-                    breakBuilder.add(glyphIndex);
-                    breakBuilder.add(glyphIndex);
-                }
-                if (unicode == 0x2060)
-                {
-                    joinerBuilder.add(offset);
-                }
-                if (wantWhiteSpace == isWhiteSpace(unicode))
-                {
-                    breakBuilder.add(glyphIndex);
-                    wantWhiteSpace = !wantWhiteSpace;
-                }
-                glyphIndex++;
-            }
-
-            lastRun = &gr;
-        }
-    }
-    if (lastRun != nullptr)
-    {
-        if (wantWhiteSpace)
-        {
-            breakBuilder.add((uint32_t)lastRun->glyphs.size());
-        }
-        else
-        {
-            // Consume the rest of the run.
-            breakBuilder.add(breakBuilder.empty() ? 0 : breakBuilder.back());
-            breakBuilder.add((uint32_t)lastRun->glyphs.size());
-        }
-        lastRun->breaks = std::move(breakBuilder);
-        lastRun->joiners = std::move(joinerBuilder);
-    }
-
-#ifdef DEBUG
-    for (const Paragraph& para : paragraphs)
-    {
-        for (const GlyphRun& gr : para.runs)
-        {
-            assert(gr.glyphs.size() > 0);
-            assert(gr.glyphs.size() == gr.textIndices.size());
-            assert(gr.glyphs.size() + 1 == gr.xpos.size());
-        }
-    }
-#endif
-    return paragraphs;
+  RawPath sanitized(path);
+  sanitized.pruneEmptySegments();
+  addRawPath(sanitized);
 }

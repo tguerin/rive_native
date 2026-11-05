@@ -20,42 +20,44 @@ import 'package:rive_native/src/semantics/semantic_tree_model.dart';
 /// Callback invoked when a screen reader activates (taps) a semantic node.
 /// The [SemanticNodeData] provides the node's artboard-space bounds so the
 /// caller can simulate a pointer event at the correct location.
-@experimental
 @internal
 typedef SemanticTapCallback = void Function(SemanticNodeData data);
 
 /// Callback invoked when a screen reader accessibility-focuses a semantic node.
-@experimental
 @internal
 typedef SemanticFocusCallback = void Function(int semanticNodeId);
 
 /// Callback invoked when accessibility focus leaves a Rive semantic node.
-@experimental
+/// [semanticNodeId] is the node that lost focus; consumers must ignore the
+/// blur when another node has taken focus since (didLose/didGain arrive as
+/// separate platform messages with no ordering guarantee).
 @internal
-typedef SemanticBlurCallback = void Function();
+typedef SemanticBlurCallback = void Function(int semanticNodeId);
 
 /// Callback invoked when a screen reader fires an increase action on a semantic
 /// node (e.g. slider step up).
-@experimental
 @internal
 typedef SemanticIncreaseCallback = void Function(SemanticNodeData data);
 
 /// Callback invoked when a screen reader fires a decrease action on a semantic
 /// node (e.g. slider step down).
-@experimental
 @internal
 typedef SemanticDecreaseCallback = void Function(SemanticNodeData data);
 
-@experimental
 @internal
 class RiveSemanticsOverlay extends LeafRenderObjectWidget {
   final SemanticTreeModel tree;
-  final AABB artboardBounds;
+
+  /// Live source of the artboard's bounds, read during the semantics
+  /// build. A getter (not a snapshot) so tree changes need not rebuild
+  /// this widget to keep the artboard-to-widget transform fresh.
+  final AABB Function() artboardBounds;
   final Fit fit;
   final Alignment alignment;
   final double layoutScaleFactor;
   final SemanticTapCallback? onSemanticTap;
   final SemanticFocusCallback? onSemanticFocus;
+  final SemanticBlurCallback? onSemanticBlur;
   final SemanticIncreaseCallback? onSemanticIncrease;
   final SemanticDecreaseCallback? onSemanticDecrease;
   const RiveSemanticsOverlay({
@@ -66,6 +68,7 @@ class RiveSemanticsOverlay extends LeafRenderObjectWidget {
     required this.layoutScaleFactor,
     this.onSemanticTap,
     this.onSemanticFocus,
+    this.onSemanticBlur,
     this.onSemanticIncrease,
     this.onSemanticDecrease,
     super.key,
@@ -81,6 +84,7 @@ class RiveSemanticsOverlay extends LeafRenderObjectWidget {
       layoutScaleFactor: layoutScaleFactor,
       onSemanticTap: onSemanticTap,
       onSemanticFocus: onSemanticFocus,
+      onSemanticBlur: onSemanticBlur,
       onSemanticIncrease: onSemanticIncrease,
       onSemanticDecrease: onSemanticDecrease,
     );
@@ -99,6 +103,7 @@ class RiveSemanticsOverlay extends LeafRenderObjectWidget {
       ..layoutScaleFactor = layoutScaleFactor
       ..onSemanticTap = onSemanticTap
       ..onSemanticFocus = onSemanticFocus
+      ..onSemanticBlur = onSemanticBlur
       ..onSemanticIncrease = onSemanticIncrease
       ..onSemanticDecrease = onSemanticDecrease;
   }
@@ -107,12 +112,13 @@ class RiveSemanticsOverlay extends LeafRenderObjectWidget {
 class RiveSemanticsRenderBox extends RenderBox {
   RiveSemanticsRenderBox({
     required SemanticTreeModel tree,
-    required AABB artboardBounds,
+    required AABB Function() artboardBounds,
     required Fit fit,
     required Alignment alignment,
     required double layoutScaleFactor,
     SemanticTapCallback? onSemanticTap,
     SemanticFocusCallback? onSemanticFocus,
+    SemanticBlurCallback? onSemanticBlur,
     SemanticIncreaseCallback? onSemanticIncrease,
     SemanticDecreaseCallback? onSemanticDecrease,
   })  : _tree = tree,
@@ -122,6 +128,7 @@ class RiveSemanticsRenderBox extends RenderBox {
         _layoutScaleFactor = layoutScaleFactor,
         _onSemanticTap = onSemanticTap,
         _onSemanticFocus = onSemanticFocus,
+        _onSemanticBlur = onSemanticBlur,
         _onSemanticIncrease = onSemanticIncrease,
         _onSemanticDecrease = onSemanticDecrease;
 
@@ -140,11 +147,13 @@ class RiveSemanticsRenderBox extends RenderBox {
     markNeedsSemanticsUpdate();
   }
 
-  AABB _artboardBounds;
-  set artboardBounds(AABB value) {
-    if (_artboardBounds == value) return;
+  AABB Function() _artboardBounds;
+  set artboardBounds(AABB Function() value) {
+    // Plain assignment: bounds are read live during the semantics build,
+    // so a new (equivalent) closure needs no invalidation. Freshness
+    // comes from tree changes and relayout, which already mark
+    // semantics dirty.
     _artboardBounds = value;
-    markNeedsSemanticsUpdate();
   }
 
   Fit _fit;
@@ -176,6 +185,11 @@ class RiveSemanticsRenderBox extends RenderBox {
   SemanticFocusCallback? _onSemanticFocus;
   set onSemanticFocus(SemanticFocusCallback? value) {
     _onSemanticFocus = value;
+  }
+
+  SemanticBlurCallback? _onSemanticBlur;
+  set onSemanticBlur(SemanticBlurCallback? value) {
+    _onSemanticBlur = value;
   }
 
   SemanticIncreaseCallback? _onSemanticIncrease;
@@ -256,17 +270,15 @@ class RiveSemanticsRenderBox extends RenderBox {
     final activeIds = <int>{};
     final rootChildren = <SemanticsNode>[];
     var sortIndex = 0.0;
+    double takeSortIndex() => sortIndex++;
 
     // Children are built in artboard-root coordinates. The shared
     // transform is attached to _transformContainer below, so Flutter's
     // compositor multiplies through to descendants without us touching
     // each rect.
     for (final rootId in _tree.roots) {
-      final child = _buildSemanticsSubtree(rootId, activeIds, sortIndex);
-      if (child != null) {
-        rootChildren.add(child);
-        sortIndex += 1.0;
-      }
+      rootChildren
+          .addAll(_buildSemanticsSubtree(rootId, activeIds, takeSortIndex));
     }
 
     // Dispose nodes no longer in the tree.
@@ -276,15 +288,16 @@ class RiveSemanticsRenderBox extends RenderBox {
       _cachedNodes.remove(id);
     }
 
+    final artboardBounds = _artboardBounds();
     final container = _transformContainer ??= SemanticsNode();
     container
       ..rect = Rect.fromLTRB(
-        _artboardBounds.minX,
-        _artboardBounds.minY,
-        _artboardBounds.maxX,
-        _artboardBounds.maxY,
+        artboardBounds.minX,
+        artboardBounds.minY,
+        artboardBounds.maxX,
+        artboardBounds.maxY,
       )
-      ..transform = _mat2DToMatrix4(_computeViewTransform())
+      ..transform = _mat2DToMatrix4(_computeViewTransform(artboardBounds))
       ..updateWith(
         config: SemanticsConfiguration(),
         childrenInInversePaintOrder: rootChildren,
@@ -296,19 +309,50 @@ class RiveSemanticsRenderBox extends RenderBox {
     );
   }
 
-  SemanticsNode? _buildSemanticsSubtree(
+  /// Builds the semantics for [id] and returns the nodes to attach to the
+  /// parent's child list. Normally that is the node itself; for a node
+  /// with degenerate (zero-area) bounds it is the node's built children,
+  /// promoted in its place. [takeSortIndex] hands out sibling sort
+  /// indices in emission order so promoted children slot into the
+  /// parent's ordering.
+  List<SemanticsNode> _buildSemanticsSubtree(
     int id,
     Set<int> activeIds,
-    double sortIndex,
+    double Function() takeSortIndex,
   ) {
     final data = _tree.nodeById(id);
-    if (data == null) return null;
+    if (data == null) return const [];
 
     // Rect is in artboard-root space. Flutter asserts that non-root
-    // SemanticsNodes must not have an empty rect, so skip nodes whose
-    // bounds are degenerate (zero area).
+    // SemanticsNodes must not have an empty rect, so a node with
+    // degenerate (zero-area or non-finite) bounds cannot be emitted - but
+    // its children may have perfectly valid bounds. Promote them into the
+    // parent's child list instead of pruning the subtree, and let the
+    // Hidden state remain the mechanism for intentional hiding. Matches
+    // the Android runtime's projection.
+    //
+    // Skipping the degenerate node is mandatory (Flutter asserts a
+    // non-root rect is finite and non-empty; a NaN transform reaches us
+    // through core's point fallback). Promoting the children rather than
+    // dropping them is defensive: core's semanticBounds already unions a
+    // container's whole descendant subtree (a drawable falls back to that
+    // union at zero size), so a parent that arrives degenerate has no
+    // bounded child to promote in the common case - promote and drop are
+    // equivalent there. They differ only when a child's bounds bypass the
+    // parent's union (e.g. a nested-artboard boundary node); promote so
+    // that child stays reachable if it arises. Covered by
+    // semantic_overlay_promotion_test.dart, not an authored file.
     final rect = Rect.fromLTRB(data.minX, data.minY, data.maxX, data.maxY);
-    if (rect.isEmpty) return null;
+    // isEmpty alone misses NaN (all NaN comparisons are false), and
+    // SemanticsNode.rect must be finite.
+    if (rect.isEmpty || !rect.isFinite) {
+      final promoted = <SemanticsNode>[];
+      for (final childId in data.children) {
+        promoted
+            .addAll(_buildSemanticsSubtree(childId, activeIds, takeSortIndex));
+      }
+      return promoted;
+    }
 
     activeIds.add(id);
 
@@ -320,37 +364,35 @@ class RiveSemanticsRenderBox extends RenderBox {
     // Explicit sort key ensures the platform accessibility layer uses
     // our ordering even when DOM element recycling on web reorders
     // existing elements among newly inserted ones.
-    semConfig.sortKey = OrdinalSortKey(sortIndex);
+    semConfig.sortKey = OrdinalSortKey(takeSortIndex());
     _applySemantics(semConfig, data);
 
     // Recurse into children.
     final childSemNodes = <SemanticsNode>[];
     var childSortIndex = 0.0;
+    double takeChildSortIndex() => childSortIndex++;
     for (final childId in data.children) {
-      final child = _buildSemanticsSubtree(childId, activeIds, childSortIndex);
-      if (child != null) {
-        childSemNodes.add(child);
-        childSortIndex += 1.0;
-      }
+      childSemNodes
+          .addAll(_buildSemanticsSubtree(childId, activeIds, takeChildSortIndex));
     }
 
     semNode.updateWith(
       config: semConfig,
       childrenInInversePaintOrder: childSemNodes,
     );
-    return semNode;
+    return [semNode];
   }
 
   // ── Coordinate mapping ──────────────────────────────────────────────────
 
   /// Compute the artboard→widget coordinate transform. This uses the same
   /// [Renderer.computeAlignment] logic as the Rive render pass.
-  Mat2D _computeViewTransform() {
+  Mat2D _computeViewTransform(AABB artboardBounds) {
     return Renderer.computeAlignment(
       _fit,
       _alignment,
       AABB.fromValues(0, 0, size.width, size.height),
-      _artboardBounds,
+      artboardBounds,
       _layoutScaleFactor,
     );
   }
@@ -432,6 +474,10 @@ class RiveSemanticsRenderBox extends RenderBox {
         config.onFocus = () => _onSemanticFocus?.call(data.id);
         config.onDidGainAccessibilityFocus =
             () => _onSemanticFocus?.call(data.id);
+      }
+      if (_onSemanticBlur != null) {
+        config.onDidLoseAccessibilityFocus =
+            () => _onSemanticBlur?.call(data.id);
       }
     }
 
@@ -532,10 +578,18 @@ class RiveSemanticsRenderBox extends RenderBox {
 
   // ── Cleanup ─────────────────────────────────────────────────────────────
 
+  // Called when the semantics owner is torn down (screen reader
+  // disconnects, or the last SemanticsHandle is released). Every cached
+  // SemanticsNode - including the transform container - belongs to that
+  // owner; reusing one under the next owner trips framework asserts
+  // ('owner!._nodes.containsKey(id)'). Drop them all so re-enabling
+  // assembles fresh nodes.
   @override
   void clearSemantics() {
     super.clearSemantics();
     _cachedNodes.clear();
+    _transformContainer = null;
+    _lastAppliedVersion = -1;
   }
 
   @override

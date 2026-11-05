@@ -87,6 +87,7 @@ target_link_libraries(${PLUGIN_NAME} PRIVATE
   rive_yoga
   miniaudio
   rive_scripting_workspace
+  rasc_front
   luau_analyzer
   luau_compiler
   luau_vm
@@ -94,6 +95,8 @@ target_link_libraries(${PLUGIN_NAME} PRIVATE
   brotli
   spirv_cross
   rive_pathops
+  rml
+  rive_codec
   -Wl,--end-group
 )
 

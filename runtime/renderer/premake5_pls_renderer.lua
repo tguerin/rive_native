@@ -8,6 +8,11 @@ newoption({
     description = 'compile with support for vulkan',
 })
 
+newoption({
+    trigger = 'with_android_vulkan_atomics',
+    description = 'compile in support and embed SPIR-V for atomic and clockwiseAtomic shaders on android',
+})
+
 -- Internal capability flag opted into by platform packages.
 newoption({
     trigger = '_console_only_ore_vk',
@@ -26,6 +31,11 @@ if _OPTIONS['with_vulkan'] then
         'VMA_STATIC_VULKAN_FUNCTIONS=0',
         'VMA_DYNAMIC_VULKAN_FUNCTIONS=1',
     })
+    -- The atomic and clockwiseAtomic SPIR-V is large, and android doesn't use
+    -- those modes by default. Make them opt-in only.
+    if rive_target_os ~= 'android' or _OPTIONS['with_android_vulkan_atomics'] then
+        defines({ 'WITH_VULKAN_ATOMICS' })
+    end
 end
 
 if rive_target_os == 'windows' and _OPTIONS['for_unreal'] == nil then
@@ -125,6 +135,12 @@ end
 -- Enable the backend so ContextVulkan::Make is defined and ORE_BACKEND_VK-gated
 -- sections compile. Mirrors the linux/android Vulkan ORE configuration.
 filter({ 'system:macosx or windows', 'options:with_rive_canvas', 'options:with_vulkan', 'options:not for_unreal' })
+do
+    defines({ 'ORE_BACKEND_VK', 'RIVE_ORE' })
+end
+
+-- Consoles: vulkan-only ORE backend, same shape as the desktop Vulkan lane.
+filter({ 'system:nx64 or ounce64', 'options:with_rive_canvas', 'options:with_vulkan', 'options:not for_unreal' })
 do
     defines({ 'ORE_BACKEND_VK', 'RIVE_ORE' })
 end
@@ -530,6 +546,12 @@ do
     -- renderer. The vulkan/VMA include dirs are already added project-wide in
     -- the `if _OPTIONS['with_vulkan']` block above.
     filter({ 'system:macosx or windows', 'options:with_rive_canvas', 'options:with_vulkan', 'options:not for_unreal' })
+    do
+        files({ 'src/ore/vulkan/*.cpp' })
+    end
+
+    -- Consoles: vulkan-only ORE, same backend files as the desktop lane.
+    filter({ 'system:nx64 or ounce64', 'options:with_rive_canvas', 'options:with_vulkan', 'options:not for_unreal' })
     do
         files({ 'src/ore/vulkan/*.cpp' })
     end

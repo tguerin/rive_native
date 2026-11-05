@@ -6,7 +6,7 @@ affiliated with or endorsed by Rive. MIT licensed, Copyright (c) 2024 Rive; see
 
 - **Upstream:** https://pub.dev/packages/rive_native. Rive does not publish a
   source repo, so the pub.dev tarball is the upstream.
-- **Vendored version:** 0.1.11 (the version resolved by `rive` 0.14.11).
+- **Vendored version:** 0.2.0-dev.4.
 
 ## Why this fork exists
 

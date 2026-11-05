@@ -10,8 +10,9 @@ import 'package:rive_native/scripting_workspace.dart';
 import 'package:rive_native/src/ffi/dynamic_library_helper.dart';
 import 'package:rive_native/src/ffi/rive_ffi.dart';
 import 'package:rive_native/src/ffi/rive_luau_ffi.dart' show initGPUScripting;
+import 'package:rive_native/src/ffi/rive_renderer_ffi.dart'
+    show FFIRiveFactory;
 import 'package:rive_native/rive_native.dart' show RenderTexture;
-import 'package:rive_native/src/rive.dart' show Factory;
 import 'package:rive_native/utilities.dart';
 
 final DynamicLibrary _nativeLib = DynamicLibraryHelper.nativeLib;
@@ -19,16 +20,15 @@ final DynamicLibrary _nativeLib = DynamicLibraryHelper.nativeLib;
 Pointer<Void> Function(
   Pointer<NativeFunction<Void Function(Uint64)>>,
   bool,
-)
-_makeScriptingWorkspace = _nativeLib
+  bool,
+) _makeScriptingWorkspace = _nativeLib
     .lookup<
-      NativeFunction<
-        Pointer<Void> Function(
-          Pointer<NativeFunction<Void Function(Uint64)>>,
-          Bool,
-        )
-      >
-    >('makeScriptingWorkspace')
+        NativeFunction<
+            Pointer<Void> Function(
+              Pointer<NativeFunction<Void Function(Uint64)>>,
+              Bool,
+              Bool,
+            )>>('makeScriptingWorkspace')
     .asFunction();
 void Function(Pointer<Void> workspace) _deleteScriptingWorkspace = _nativeLib
     .lookup<NativeFunction<Void Function(Pointer<Void>)>>(
@@ -41,19 +41,16 @@ int Function(
   Pointer<Utf8> scriptName,
   Pointer<Utf8> source,
   bool highlight,
-)
-_setScriptSource = _nativeLib
+) _setScriptSource = _nativeLib
     .lookup<
-      NativeFunction<
-        Uint64 Function(
-          Pointer<Void>,
-          Pointer<Utf8>,
-          Pointer<Utf8>,
-          Pointer<Utf8>,
-          Bool,
-        )
-      >
-    >('scriptingWorkspaceSetScriptSource')
+        NativeFunction<
+            Uint64 Function(
+              Pointer<Void>,
+              Pointer<Utf8>,
+              Pointer<Utf8>,
+              Pointer<Utf8>,
+              Bool,
+            )>>('scriptingWorkspaceSetScriptSource')
     .asFunction();
 
 int Function(
@@ -64,21 +61,18 @@ int Function(
   int libraryId,
   int libraryVersionId,
   bool highlight,
-)
-_setScriptSourceScoped = _nativeLib
+) _setScriptSourceScoped = _nativeLib
     .lookup<
-      NativeFunction<
-        Uint64 Function(
-          Pointer<Void>,
-          Pointer<Utf8>,
-          Pointer<Utf8>,
-          Pointer<Utf8>,
-          Uint64,
-          Uint64,
-          Bool,
-        )
-      >
-    >('scriptingWorkspaceSetScriptSourceScoped')
+        NativeFunction<
+            Uint64 Function(
+              Pointer<Void>,
+              Pointer<Utf8>,
+              Pointer<Utf8>,
+              Pointer<Utf8>,
+              Uint64,
+              Uint64,
+              Bool,
+            )>>('scriptingWorkspaceSetScriptSourceScoped')
     .asFunction();
 
 void Function(
@@ -86,11 +80,11 @@ void Function(
   Pointer<Utf8> scriptId,
   int libraryId,
   int libraryVersionId,
-)
-_setScriptScope = _nativeLib
+) _setScriptScope = _nativeLib
     .lookup<
-      NativeFunction<Void Function(Pointer<Void>, Pointer<Utf8>, Uint64, Uint64)>
-    >('scriptingWorkspaceSetScriptScope')
+        NativeFunction<
+            Void Function(Pointer<Void>, Pointer<Utf8>, Uint64,
+                Uint64)>>('scriptingWorkspaceSetScriptScope')
     .asFunction();
 
 void Function(
@@ -100,20 +94,17 @@ void Function(
   Pointer<Utf8> name,
   int targetLibraryId,
   int targetLibraryVersionId,
-)
-_setLibraryImport = _nativeLib
+) _setLibraryImport = _nativeLib
     .lookup<
-      NativeFunction<
-        Void Function(
-          Pointer<Void>,
-          Uint64,
-          Uint64,
-          Pointer<Utf8>,
-          Uint64,
-          Uint64,
-        )
-      >
-    >('scriptingWorkspaceSetLibraryImport')
+        NativeFunction<
+            Void Function(
+              Pointer<Void>,
+              Uint64,
+              Uint64,
+              Pointer<Utf8>,
+              Uint64,
+              Uint64,
+            )>>('scriptingWorkspaceSetLibraryImport')
     .asFunction();
 
 void Function(
@@ -121,34 +112,30 @@ void Function(
   int callerLibraryId,
   int callerLibraryVersionId,
   Pointer<Utf8> name,
-)
-_removeLibraryImport = _nativeLib
+) _removeLibraryImport = _nativeLib
     .lookup<
-      NativeFunction<
-        Void Function(Pointer<Void>, Uint64, Uint64, Pointer<Utf8>)
-      >
-    >('scriptingWorkspaceRemoveLibraryImport')
+        NativeFunction<
+            Void Function(Pointer<Void>, Uint64, Uint64,
+                Pointer<Utf8>)>>('scriptingWorkspaceRemoveLibraryImport')
     .asFunction();
 
-int Function(Pointer<Void> workspace, Pointer<Utf8> scriptId)
-_rewriteRequires = _nativeLib
-    .lookup<NativeFunction<Uint64 Function(Pointer<Void>, Pointer<Utf8>)>>(
-      'scriptingWorkspaceRewriteRequires',
-    )
-    .asFunction();
+int Function(Pointer<Void> workspace, Pointer<Utf8> scriptId) _rewriteRequires =
+    _nativeLib
+        .lookup<NativeFunction<Uint64 Function(Pointer<Void>, Pointer<Utf8>)>>(
+          'scriptingWorkspaceRewriteRequires',
+        )
+        .asFunction();
 
 void Function(
   Pointer<Void> workspace,
   int libraryId,
   int libraryVersionId,
   Pointer<Utf8> canonicalName,
-)
-_setLibraryCanonicalName = _nativeLib
+) _setLibraryCanonicalName = _nativeLib
     .lookup<
-      NativeFunction<
-        Void Function(Pointer<Void>, Uint64, Uint64, Pointer<Utf8>)
-      >
-    >('scriptingWorkspaceSetLibraryCanonicalName')
+        NativeFunction<
+            Void Function(Pointer<Void>, Uint64, Uint64,
+                Pointer<Utf8>)>>('scriptingWorkspaceSetLibraryCanonicalName')
     .asFunction();
 
 int Function(
@@ -158,20 +145,39 @@ int Function(
   Pointer<Utf8> source,
   int scriptType,
   bool highlight,
-)
-_setScriptSourceWithType = _nativeLib
+) _setScriptSourceWithType = _nativeLib
     .lookup<
-      NativeFunction<
-        Uint64 Function(
-          Pointer<Void>,
-          Pointer<Utf8>,
-          Pointer<Utf8>,
-          Pointer<Utf8>,
-          Uint8,
-          Bool,
-        )
-      >
-    >('scriptingWorkspaceSetScriptSourceWithType')
+        NativeFunction<
+            Uint64 Function(
+              Pointer<Void>,
+              Pointer<Utf8>,
+              Pointer<Utf8>,
+              Pointer<Utf8>,
+              Uint8,
+              Bool,
+            )>>('scriptingWorkspaceSetScriptSourceWithType')
+    .asFunction();
+
+int Function(
+  Pointer<Void> workspace,
+  Pointer<Utf8> scriptId,
+  Pointer<Utf8> scriptName,
+  Pointer<Utf8> source,
+  Pointer<Utf8> formatScriptId,
+  Pointer<Utf8> formatExtension,
+  bool highlight,
+) _setDocumentSource = _nativeLib
+    .lookup<
+        NativeFunction<
+            Uint64 Function(
+              Pointer<Void>,
+              Pointer<Utf8>,
+              Pointer<Utf8>,
+              Pointer<Utf8>,
+              Pointer<Utf8>,
+              Pointer<Utf8>,
+              Bool,
+            )>>('scriptingWorkspaceSetDocumentSource')
     .asFunction();
 
 void Function(Pointer<Void> workspace) _checkScriptsWithRequires = _nativeLib
@@ -181,56 +187,52 @@ void Function(Pointer<Void> workspace) _checkScriptsWithRequires = _nativeLib
     .asFunction();
 
 void Function(Pointer<Void> workspace, Pointer<Utf8> scriptId)
-_removeScriptSource = _nativeLib
-    .lookup<NativeFunction<Void Function(Pointer<Void>, Pointer<Utf8>)>>(
-      'scriptingWorkspaceRemoveScriptSource',
-    )
-    .asFunction();
+    _removeScriptSource = _nativeLib
+        .lookup<NativeFunction<Void Function(Pointer<Void>, Pointer<Utf8>)>>(
+          'scriptingWorkspaceRemoveScriptSource',
+        )
+        .asFunction();
 
 int Function(
   Pointer<Void> workspace,
   Pointer<Utf8> scriptId,
   Pointer<Utf8> source,
-)
-_setScriptDiffSource = _nativeLib
+) _setScriptDiffSource = _nativeLib
     .lookup<
-      NativeFunction<
-        Uint64 Function(Pointer<Void>, Pointer<Utf8>, Pointer<Utf8>)
-      >
-    >('scriptingWorkspaceSetScriptDiffSource')
+        NativeFunction<
+            Uint64 Function(Pointer<Void>, Pointer<Utf8>,
+                Pointer<Utf8>)>>('scriptingWorkspaceSetScriptDiffSource')
     .asFunction();
 
 void Function(Pointer<Void> workspace, Pointer<Utf8> scriptId)
-_clearScriptDiffSource = _nativeLib
-    .lookup<NativeFunction<Void Function(Pointer<Void>, Pointer<Utf8>)>>(
-      'scriptingWorkspaceClearScriptDiffSource',
-    )
-    .asFunction();
+    _clearScriptDiffSource = _nativeLib
+        .lookup<NativeFunction<Void Function(Pointer<Void>, Pointer<Utf8>)>>(
+          'scriptingWorkspaceClearScriptDiffSource',
+        )
+        .asFunction();
 
 int Function(Pointer<Void> workspace, Pointer<Utf8> scriptId, int line)
-_requestDiffSourceLine = _nativeLib
-    .lookup<
-      NativeFunction<Uint64 Function(Pointer<Void>, Pointer<Utf8>, Uint32)>
-    >('scriptingWorkspaceRequestDiffSourceLine')
-    .asFunction();
+    _requestDiffSourceLine = _nativeLib
+        .lookup<
+            NativeFunction<
+                Uint64 Function(Pointer<Void>, Pointer<Utf8>,
+                    Uint32)>>('scriptingWorkspaceRequestDiffSourceLine')
+        .asFunction();
 
 int Function(
   Pointer<Void> workspace,
   Pointer<Utf8> scriptName,
   Pointer<Utf8> prefix,
   Pointer<Utf8> source,
-)
-_setSystemGeneratedSource = _nativeLib
+) _setSystemGeneratedSource = _nativeLib
     .lookup<
-      NativeFunction<
-        Uint64 Function(
-          Pointer<Void>,
-          Pointer<Utf8>,
-          Pointer<Utf8>,
-          Pointer<Utf8>,
-        )
-      >
-    >('scriptingWorkspaceSetSystemGeneratedSource')
+        NativeFunction<
+            Uint64 Function(
+              Pointer<Void>,
+              Pointer<Utf8>,
+              Pointer<Utf8>,
+              Pointer<Utf8>,
+            )>>('scriptingWorkspaceSetSystemGeneratedSource')
     .asFunction();
 
 int Function(Pointer<Void> workspace, Pointer<Utf8> source) _format = _nativeLib
@@ -246,13 +248,11 @@ int Function(
   bool compileDependencies,
   int,
   int,
-)
-_compile = _nativeLib
+) _compile = _nativeLib
     .lookup<
-      NativeFunction<
-        Uint64 Function(Pointer<Void>, Pointer<Utf8>, Bool, Bool, Uint8, Uint8)
-      >
-    >('scriptingWorkspaceCompile')
+        NativeFunction<
+            Uint64 Function(Pointer<Void>, Pointer<Utf8>, Bool, Bool, Uint8,
+                Uint8)>>('scriptingWorkspaceCompile')
     .asFunction();
 
 int Function(
@@ -262,13 +262,11 @@ int Function(
   bool failOnErrors,
   int,
   int,
-)
-_compileAndSign = _nativeLib
+) _compileAndSign = _nativeLib
     .lookup<
-      NativeFunction<
-        Uint64 Function(Pointer<Void>, Pointer<Uint8>, Size, Bool, Uint8, Uint8)
-      >
-    >('scriptingWorkspaceCompileAndSign')
+        NativeFunction<
+            Uint64 Function(Pointer<Void>, Pointer<Uint8>, Size, Bool, Uint8,
+                Uint8)>>('scriptingWorkspaceCompileAndSign')
     .asFunction();
 
 void Function(Pointer<Void> workspace, Pointer<Void> oreContext)
@@ -292,12 +290,46 @@ int Function(Pointer<Void> workspace, Pointer<Void> factory) _requestVM =
         )
         .asFunction();
 
-int Function(Pointer<Void> workspace, Pointer<Utf8> scriptId)
-_checkNeedsRecompile = _nativeLib
-    .lookup<NativeFunction<Uint64 Function(Pointer<Void>, Pointer<Utf8>)>>(
-      'scriptingWorkspaceCheckNeedsRecompile',
-    )
+int Function(
+  Pointer<Void> workspace,
+  int simd,
+  bool forExport,
+  bool debugProbes,
+  bool fuel,
+) _requestCompileWasmAs = _nativeLib
+    .lookup<
+            NativeFunction<
+                Uint64 Function(Pointer<Void>, Uint8, Bool, Bool, Bool)>>(
+        'scriptingWorkspaceRequestCompileWasmAs')
     .asFunction();
+
+int Function(Pointer<Void> workspace, Pointer<Utf8> scriptId)
+    _requestTranslateToAs = _nativeLib
+        .lookup<NativeFunction<Uint64 Function(Pointer<Void>, Pointer<Utf8>)>>(
+            'scriptingWorkspaceRequestTranslateToAs')
+        .asFunction();
+
+void Function(Pointer<Void> workspace, int simd) _setAsBakeOptions = _nativeLib
+    .lookup<NativeFunction<Void Function(Pointer<Void>, Uint8)>>(
+        'scriptingWorkspaceSetAsBakeOptions')
+    .asFunction();
+
+bool Function(Pointer<Void> workspace) _setBundledRascStd = _nativeLib
+    .lookup<NativeFunction<Bool Function(Pointer<Void>)>>(
+        'scriptingWorkspaceSetBundledRascStd')
+    .asFunction();
+void Function(Pointer<Void> workspace, Pointer<Utf8> dir) _setRascStdDir =
+    _nativeLib
+        .lookup<NativeFunction<Void Function(Pointer<Void>, Pointer<Utf8>)>>(
+            'scriptingWorkspaceSetRascStdDir')
+        .asFunction();
+
+int Function(Pointer<Void> workspace, Pointer<Utf8> scriptId)
+    _checkNeedsRecompile = _nativeLib
+        .lookup<NativeFunction<Uint64 Function(Pointer<Void>, Pointer<Utf8>)>>(
+          'scriptingWorkspaceCheckNeedsRecompile',
+        )
+        .asFunction();
 
 int Function(
   Pointer<Void> workspace,
@@ -307,21 +339,18 @@ int Function(
   bool matchWholeWord,
   bool regularExpression,
   bool trim,
-)
-_findInFiles = _nativeLib
+) _findInFiles = _nativeLib
     .lookup<
-      NativeFunction<
-        Uint64 Function(
-          Pointer<Void>,
-          Pointer<Uint8>,
-          Size,
-          Bool,
-          Bool,
-          Bool,
-          Bool,
-        )
-      >
-    >('scriptingWorkspaceFindInFiles')
+        NativeFunction<
+            Uint64 Function(
+              Pointer<Void>,
+              Pointer<Uint8>,
+              Size,
+              Bool,
+              Bool,
+              Bool,
+              Bool,
+            )>>('scriptingWorkspaceFindInFiles')
     .asFunction();
 
 int Function(Pointer<Void> workspace, Pointer<Utf8> source) _implementedType =
@@ -331,12 +360,13 @@ int Function(Pointer<Void> workspace, Pointer<Utf8> source) _implementedType =
         )
         .asFunction();
 
-int Function(Pointer<Void>, Pointer<Utf8> scriptName)
-_requestProblemReport = _nativeLib
-    .lookup<
-      NativeFunction<Uint64 Function(Pointer<Void>, Pointer<Utf8> scriptName)>
-    >('scriptingWorkspaceRequestProblemReport')
-    .asFunction();
+int Function(Pointer<Void>, Pointer<Utf8> scriptName) _requestProblemReport =
+    _nativeLib
+        .lookup<
+                NativeFunction<
+                    Uint64 Function(Pointer<Void>, Pointer<Utf8> scriptName)>>(
+            'scriptingWorkspaceRequestProblemReport')
+        .asFunction();
 
 int Function(Pointer<Void>) _requestFullProblemReport = _nativeLib
     .lookup<NativeFunction<Uint64 Function(Pointer<Void>)>>(
@@ -345,73 +375,71 @@ int Function(Pointer<Void>) _requestFullProblemReport = _nativeLib
     .asFunction();
 
 int Function(Pointer<Void>, Pointer<Utf8> scriptName, int line, int column)
-_scriptingWorkspaceCompleteInsertion = _nativeLib
-    .lookup<
-      NativeFunction<
-        Uint64 Function(
-          Pointer<Void>,
-          Pointer<Utf8> scriptName,
-          Uint32 line,
-          Uint32 column,
-        )
-      >
-    >('scriptingWorkspaceCompleteInsertion')
-    .asFunction();
+    _scriptingWorkspaceCompleteInsertion = _nativeLib
+        .lookup<
+            NativeFunction<
+                Uint64 Function(
+                  Pointer<Void>,
+                  Pointer<Utf8> scriptName,
+                  Uint32 line,
+                  Uint32 column,
+                )>>('scriptingWorkspaceCompleteInsertion')
+        .asFunction();
 
 int Function(Pointer<Void>, Pointer<Utf8> scriptName, int line, int column)
-_scriptingWorkspaceRequestAutocomplete = _nativeLib
-    .lookup<
-      NativeFunction<
-        Uint64 Function(
-          Pointer<Void>,
-          Pointer<Utf8> scriptName,
-          Uint32 line,
-          Uint32 column,
-        )
-      >
-    >('scriptingWorkspaceRequestAutocomplete')
-    .asFunction();
+    _scriptingWorkspaceRequestAutocomplete = _nativeLib
+        .lookup<
+            NativeFunction<
+                Uint64 Function(
+                  Pointer<Void>,
+                  Pointer<Utf8> scriptName,
+                  Uint32 line,
+                  Uint32 column,
+                )>>('scriptingWorkspaceRequestAutocomplete')
+        .asFunction();
 
 int Function(Pointer<Void>, Pointer<Utf8> scriptName, int line, int column)
-_scriptingWorkspaceRequestAutocompleteWGSL = _nativeLib
-    .lookup<
-      NativeFunction<
-        Uint64 Function(
-          Pointer<Void>,
-          Pointer<Utf8> scriptName,
-          Uint32 line,
-          Uint32 column,
-        )
-      >
-    >('scriptingWorkspaceRequestAutocompleteWGSL')
-    .asFunction();
+    _scriptingWorkspaceRequestAutocompleteWGSL = _nativeLib
+        .lookup<
+            NativeFunction<
+                Uint64 Function(
+                  Pointer<Void>,
+                  Pointer<Utf8> scriptName,
+                  Uint32 line,
+                  Uint32 column,
+                )>>('scriptingWorkspaceRequestAutocompleteWGSL')
+        .asFunction();
 
 int Function(Pointer<Void>, Pointer<Utf8> scriptName, int line, int column)
-_scriptingWorkspaceRequestGetDefinition = _nativeLib
-    .lookup<
-      NativeFunction<
-        Uint64 Function(
-          Pointer<Void>,
-          Pointer<Utf8> scriptName,
-          Uint32 line,
-          Uint32 column,
-        )
-      >
-    >('scriptingWorkspaceRequestGetDefinition')
-    .asFunction();
+    _scriptingWorkspaceRequestGetDefinition = _nativeLib
+        .lookup<
+            NativeFunction<
+                Uint64 Function(
+                  Pointer<Void>,
+                  Pointer<Utf8> scriptName,
+                  Uint32 line,
+                  Uint32 column,
+                )>>('scriptingWorkspaceRequestGetDefinition')
+        .asFunction();
 
 HighlightBuffer Function(Pointer<Void>, Pointer<Utf8> scriptName, int row)
-_scriptingWorkspaceHighlightRow = _nativeLib
-    .lookup<
-      NativeFunction<
-        HighlightBuffer Function(
-          Pointer<Void>,
-          Pointer<Utf8> scriptName,
-          Uint32 row,
-        )
-      >
-    >('scriptingWorkspaceHighlightRow')
-    .asFunction();
+    _scriptingWorkspaceHighlightRow = _nativeLib
+        .lookup<
+            NativeFunction<
+                HighlightBuffer Function(
+                  Pointer<Void>,
+                  Pointer<Utf8> scriptName,
+                  Uint32 row,
+                )>>('scriptingWorkspaceHighlightRow')
+        .asFunction();
+
+FormatParseBuffer Function(Pointer<Void>, Pointer<Utf8> docId)
+    _scriptingWorkspaceFormatParseData = _nativeLib
+        .lookup<
+            NativeFunction<
+                FormatParseBuffer Function(Pointer<Void>,
+                    Pointer<Utf8>)>>('scriptingWorkspaceFormatParseData')
+        .asFunction();
 
 Pointer<Uint8> Function() _nativeFontBytes = _nativeLib
     .lookup<NativeFunction<Pointer<Uint8> Function()>>('nativeFontBytes')
@@ -426,31 +454,39 @@ void Function() _freeNativeFont = _nativeLib
     .asFunction();
 
 final Pointer<Utf8> Function(Pointer<Void>)
-_scriptingWorkspaceBuiltinDefinitions = nativeLib
-    .lookup<NativeFunction<Pointer<Utf8> Function(Pointer<Void>)>>(
-      'scriptingWorkspaceBuiltinDefinitions',
-    )
-    .asFunction();
+    _scriptingWorkspaceBuiltinDefinitions = nativeLib
+        .lookup<NativeFunction<Pointer<Utf8> Function(Pointer<Void>)>>(
+          'scriptingWorkspaceBuiltinDefinitions',
+        )
+        .asFunction();
 
 final Pointer<Utf8> Function(Pointer<Void>)
-_scriptingWorkspaceBuiltinDefinitionKeys = nativeLib
-    .lookup<NativeFunction<Pointer<Utf8> Function(Pointer<Void>)>>(
-      'scriptingWorkspaceBuiltinDefinitionKeys',
-    )
-    .asFunction();
+    _scriptingWorkspaceBuiltinDefinitionKeys = nativeLib
+        .lookup<NativeFunction<Pointer<Utf8> Function(Pointer<Void>)>>(
+          'scriptingWorkspaceBuiltinDefinitionKeys',
+        )
+        .asFunction();
 
 final Pointer<Utf8> Function(Pointer<Void>, Pointer<Utf8>)
-_scriptingWorkspaceBuiltinDefinition = nativeLib
-    .lookup<
-      NativeFunction<Pointer<Utf8> Function(Pointer<Void>, Pointer<Utf8>)>
-    >('scriptingWorkspaceBuiltinDefinition')
-    .asFunction();
+    _scriptingWorkspaceBuiltinDefinition = nativeLib
+        .lookup<
+            NativeFunction<
+                Pointer<Utf8> Function(Pointer<Void>,
+                    Pointer<Utf8>)>>('scriptingWorkspaceBuiltinDefinition')
+        .asFunction();
 
 final class HighlightBuffer extends Struct {
   @Uint32()
   external int count;
 
   external Pointer<Uint32> data;
+}
+
+final class FormatParseBuffer extends Struct {
+  @Uint32()
+  external int count;
+
+  external Pointer<Uint8> data;
 }
 
 final class ScriptingWorkspaceResponseResultFFI extends Struct
@@ -476,22 +512,19 @@ final class ScriptingWorkspaceResponseResultFFI extends Struct
 ScriptingWorkspaceResponseResultFFI Function(
   Pointer<Void> workspace,
   int workId,
-)
-_scriptingWorkspaceResponse = _nativeLib
+) _scriptingWorkspaceResponse = _nativeLib
     .lookup<
-      NativeFunction<
-        ScriptingWorkspaceResponseResultFFI Function(
-          Pointer<Void> workspace,
-          Uint64 workId,
-        )
-      >
-    >('scriptingWorkspaceResponse')
+        NativeFunction<
+            ScriptingWorkspaceResponseResultFFI Function(
+              Pointer<Void> workspace,
+              Uint64 workId,
+            )>>('scriptingWorkspaceResponse')
     .asFunction();
 
 class ScriptingWorkspaceFFI extends ScriptingWorkspace {
   late Pointer<Void> _nativeWorkspace;
   NativeCallable<Void Function(Uint64)>? _callable;
-  ScriptingWorkspaceFFI({bool canvasEnabled = false}) {
+  ScriptingWorkspaceFFI({bool canvasEnabled = false, bool netEnabled = false}) {
     _callable = NativeCallable<Void Function(Uint64)>.listener(
       workReadyCallback,
     );
@@ -503,6 +536,7 @@ class ScriptingWorkspaceFFI extends ScriptingWorkspace {
             return _makeScriptingWorkspace(
               callback.nativeFunction,
               canvasEnabled,
+              netEnabled,
             );
           })();
   }
@@ -749,6 +783,42 @@ class ScriptingWorkspaceFFI extends ScriptingWorkspace {
   }
 
   @override
+  Future<HighlightResult> setDocumentSource(
+    String scriptId,
+    String scriptName,
+    String source, {
+    required String formatScriptId,
+    required String formatExtension,
+    bool highlight = false,
+  }) async {
+    final scriptIdNative = scriptId.toNativeUtf8(allocator: calloc);
+    final scriptNameNative = scriptName.toNativeUtf8(allocator: calloc);
+    final sourceNative = toNativeString(source);
+    final formatScriptIdNative = formatScriptId.toNativeUtf8(allocator: calloc);
+    final formatExtensionNative = formatExtension.toNativeUtf8(
+      allocator: calloc,
+    );
+    final workId = _setDocumentSource(
+      _nativeWorkspace,
+      scriptIdNative,
+      scriptNameNative,
+      sourceNative,
+      formatScriptIdNative,
+      formatExtensionNative,
+      highlight,
+    );
+    calloc.free(formatExtensionNative);
+    calloc.free(formatScriptIdNative);
+    calloc.free(scriptNameNative);
+    calloc.free(scriptIdNative);
+    if (!highlight) {
+      unawaited(registerCompleter(workId));
+      return HighlightResult(HighlightResultType.unknown);
+    }
+    return registerCompleter(workId);
+  }
+
+  @override
   void removeScriptSource(String scriptId) {
     _removeScriptSource(_nativeWorkspace, toNativeString(scriptId));
   }
@@ -883,6 +953,68 @@ class ScriptingWorkspaceFFI extends ScriptingWorkspace {
   }
 
   @override
+  Future<WasmModuleResult?> requestCompileWasmAs({
+    WasmSimd simd = WasmSimd.on,
+    bool forExport = false,
+    bool debugProbes = true,
+    bool fuel = false,
+  }) {
+    final workId = _requestCompileWasmAs(
+        _nativeWorkspace, simd.index, forExport, debugProbes, fuel);
+    return registerCompleter(workId);
+  }
+
+  @override
+  void setAsBakeOptions({WasmSimd simd = WasmSimd.on}) =>
+      _setAsBakeOptions(_nativeWorkspace, simd.index);
+
+  @override
+  bool setBundledRascStd() => _setBundledRascStd(_nativeWorkspace);
+
+  @override
+  void setRascStdDir(String dir) {
+    final dirNative = dir.toNativeUtf8(allocator: calloc);
+    _setRascStdDir(_nativeWorkspace, dirNative);
+    calloc.free(dirNative);
+  }
+
+  @override
+  Future<AsTranslation?> requestTranslateToAs(String scriptId) {
+    final scriptIdNative = scriptId.toNativeUtf8(allocator: calloc);
+    final workId = _requestTranslateToAs(_nativeWorkspace, scriptIdNative);
+    calloc.free(scriptIdNative);
+    return registerCompleter(workId);
+  }
+
+  @override
+  Future<HighlightResult> setAnimaScriptSource(
+    String scriptId,
+    String scriptName,
+    String source, {
+    bool highlight = false,
+  }) async {
+    final scriptIdNative = scriptId.toNativeUtf8(allocator: calloc);
+    final scriptNameNative = scriptName.toNativeUtf8(allocator: calloc);
+    final sourceNative = toNativeString(source);
+    // ScriptType::AnimaScript = 5
+    final workId = _setScriptSourceWithType(
+      _nativeWorkspace,
+      scriptIdNative,
+      scriptNameNative,
+      sourceNative,
+      5,
+      highlight,
+    );
+    calloc.free(scriptNameNative);
+    calloc.free(scriptIdNative);
+    if (!highlight) {
+      unawaited(registerCompleter(workId));
+      return HighlightResult(HighlightResultType.unknown);
+    }
+    return registerCompleter(workId);
+  }
+
+  @override
   Future<bool> checkNeedsRecompile(String scriptId) {
     final scriptIdNative = scriptId.toNativeUtf8(allocator: calloc);
     final workId = _checkNeedsRecompile(_nativeWorkspace, scriptIdNative);
@@ -938,6 +1070,20 @@ class ScriptingWorkspaceFFI extends ScriptingWorkspace {
   }
 
   @override
+  Uint8List? formatParseData(String docId) {
+    final docIdNative = toNativeString(docId);
+    final result = _scriptingWorkspaceFormatParseData(
+      _nativeWorkspace,
+      docIdNative,
+    );
+    if (result.data == nullptr) {
+      return null;
+    }
+    // The pointer aliases a native scratch buffer; copy before the next call.
+    return Uint8List.fromList(result.data.asTypedList(result.count));
+  }
+
+  @override
   Future<InsertionCompletion> completeInsertion(
     String scriptName,
     ScriptPosition position,
@@ -968,13 +1114,19 @@ class ScriptingWorkspaceFFI extends ScriptingWorkspace {
 
   @override
   String builtinDefinition(String key) => _scriptingWorkspaceBuiltinDefinition(
-    _nativeWorkspace,
-    toNativeString(key),
-  ).toDartString();
+        _nativeWorkspace,
+        toNativeString(key),
+      ).toDartString();
 }
 
-ScriptingWorkspace makeScriptingWorkspace({bool canvasEnabled = false}) =>
-    ScriptingWorkspaceFFI(canvasEnabled: canvasEnabled);
+ScriptingWorkspace makeScriptingWorkspace({
+  bool canvasEnabled = false,
+  bool netEnabled = false,
+}) =>
+    ScriptingWorkspaceFFI(
+      canvasEnabled: canvasEnabled,
+      netEnabled: netEnabled,
+    );
 
 /// Configures GPU scripting on native. Skips when [renderTexture] is null —
 /// callers without a backing texture (headless/test paths) wouldn't have a
@@ -987,7 +1139,9 @@ void configureGPUFromRenderTextureImpl(
   final oreCtxAddress = initGPUScriptingForPlatform();
   if (oreCtxAddress != 0) {
     workspace.setOreContext(oreCtxAddress);
-    workspace.setRenderContext(Factory.rive.nativePointerAddress);
+    // Not Factory.rive, that resolves to the session and its pointer is the
+    // session, not the render context this wants.
+    workspace.setRenderContext(FFIRiveFactory.instance.nativePointerAddress);
   }
 }
 
@@ -995,12 +1149,14 @@ void configureGPUFromRenderTextureImpl(
 /// pointer address (0 on failure). Process-lifetime; pass to
 /// [ScriptingWorkspace.setOreContext] on every workspace you create.
 int initGPUScriptingForPlatform() {
-  final rcPtr = Pointer<Void>.fromAddress(Factory.rive.nativePointerAddress);
+  final rcPtr =
+      Pointer<Void>.fromAddress(FFIRiveFactory.instance.nativePointerAddress);
   if (rcPtr == nullptr) {
     return 0;
   }
   return initGPUScripting(rcPtr).address;
 }
+
 Uint8List getNativeFontBytes() {
   final bytes = _nativeFontBytes();
   final size = _nativeFontSize();

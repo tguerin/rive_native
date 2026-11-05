@@ -8,4 +8,4 @@ analyzer:
     - centaur/**
     - joel/**
     - sanity/**
-    - santity_integration_test/**
+    - sanity_integration_test/**

@@ -229,9 +229,57 @@ final bool Function(Pointer<Void> manager, Pointer<Void> artboard)
         .asFunction();
 
 final void Function(Pointer<Void> manager, Pointer<Void> node)
+    _focusManagerRequestFocus = nativeLib
+        .lookup<NativeFunction<Void Function(Pointer<Void>, Pointer<Void>)>>(
+          'focusManagerRequestFocus',
+        )
+        .asFunction();
+
+final void Function(Pointer<Void> manager) _focusManagerRequestClearFocus =
+    nativeLib
+        .lookup<NativeFunction<Void Function(Pointer<Void>)>>(
+          'focusManagerRequestClearFocus',
+        )
+        .asFunction();
+
+final void Function(Pointer<Void> manager, int traversalKind)
+    _focusManagerRequestTraversal = nativeLib
+        .lookup<NativeFunction<Void Function(Pointer<Void>, Uint32)>>(
+          'focusManagerRequestTraversal',
+        )
+        .asFunction();
+
+final void Function(Pointer<Void> manager)
+    _focusManagerProcessAllPendingFocusRequests = nativeLib
+        .lookup<NativeFunction<Void Function(Pointer<Void>)>>(
+          'focusManagerProcessAllPendingFocusRequests',
+        )
+        .asFunction();
+
+final void Function(Pointer<Void> manager)
+    _focusManagerFinishAllPendingFocusRequests = nativeLib
+        .lookup<NativeFunction<Void Function(Pointer<Void>)>>(
+          'focusManagerFinishAllPendingFocusRequests',
+        )
+        .asFunction();
+
+final void Function(Pointer<Void> manager, Pointer<Void> node)
     _focusManagerSetFocus = nativeLib
         .lookup<NativeFunction<Void Function(Pointer<Void>, Pointer<Void>)>>(
           'focusManagerSetFocus',
+        )
+        .asFunction();
+
+final void Function(Pointer<Void> manager) _focusManagerPressBegan = nativeLib
+    .lookup<NativeFunction<Void Function(Pointer<Void>)>>(
+      'focusManagerPressBegan',
+    )
+    .asFunction();
+
+final void Function(Pointer<Void> manager, double x, double y)
+    _focusManagerPressEnded = nativeLib
+        .lookup<NativeFunction<Void Function(Pointer<Void>, Float, Float)>>(
+          'focusManagerPressEnded',
         )
         .asFunction();
 
@@ -357,6 +405,20 @@ final bool Function(Pointer<Void> manager, Pointer<Utf8> text)
     _focusManagerTextInput = nativeLib
         .lookup<NativeFunction<Bool Function(Pointer<Void>, Pointer<Utf8>)>>(
           'focusManagerTextInput',
+        )
+        .asFunction();
+
+final Pointer<Utf8> Function(Pointer<Void> manager)
+    _focusManagerSelectedText = nativeLib
+        .lookup<NativeFunction<Pointer<Utf8> Function(Pointer<Void>)>>(
+          'focusManagerSelectedText',
+        )
+        .asFunction();
+
+final bool Function(Pointer<Void> manager)
+    _focusManagerPrimaryFocusAcceptsText = nativeLib
+        .lookup<NativeFunction<Bool Function(Pointer<Void>)>>(
+          'focusManagerPrimaryFocusAcceptsText',
         )
         .asFunction();
 
@@ -674,6 +736,16 @@ final class FocusManagerFFI implements focus.FocusManager, Finalizable {
   }
 
   @override
+  void pressBegan() {
+    _focusManagerPressBegan(_pointer);
+  }
+
+  @override
+  void pressEnded(double x, double y) {
+    _focusManagerPressEnded(_pointer, x, y);
+  }
+
+  @override
   void clearFocus() {
     _focusManagerClearFocus(_pointer);
   }
@@ -781,6 +853,14 @@ final class FocusManagerFFI implements focus.FocusManager, Finalizable {
   }
 
   @override
+  String selectedText() =>
+      safeString(_focusManagerSelectedText(_pointer), deleteNative: true);
+
+  @override
+  bool primaryFocusAcceptsText() =>
+      _focusManagerPrimaryFocusAcceptsText(_pointer);
+
+  @override
   ({double minX, double minY, double maxX, double maxY})? primaryFocusBounds() {
     final minX = calloc<Float>();
     final minY = calloc<Float>();
@@ -829,6 +909,35 @@ final class FocusManagerFFI implements focus.FocusManager, Finalizable {
       _pointer,
       Pointer<Void>.fromAddress(artboardPtr),
     );
+  }
+
+  @override
+  void requestFocus(focus.FocusNode node) {
+    final nodePointer = FocusManagerFFI._getPointer(node);
+    if (nodePointer == null) {
+      return;
+    }
+    _focusManagerRequestFocus(_pointer, nodePointer);
+  }
+
+  @override
+  void requestClearFocus() {
+    _focusManagerRequestClearFocus(_pointer);
+  }
+
+  @override
+  void requestTraversal(int traversalKind) {
+    _focusManagerRequestTraversal(_pointer, traversalKind);
+  }
+
+  @override
+  void processAllPendingFocusRequests() {
+    _focusManagerProcessAllPendingFocusRequests(_pointer);
+  }
+
+  @override
+  void finishAllPendingFocusRequests() {
+    _focusManagerFinishAllPendingFocusRequests(_pointer);
   }
 
   @override
@@ -884,6 +993,16 @@ final class NativeFocusManagerWrapper implements focus.FocusManager {
   @override
   void setFocus(focus.FocusNode node) {
     _focusManagerSetFocus(_pointer, FocusManagerFFI._getPointer(node)!);
+  }
+
+  @override
+  void pressBegan() {
+    _focusManagerPressBegan(_pointer);
+  }
+
+  @override
+  void pressEnded(double x, double y) {
+    _focusManagerPressEnded(_pointer, x, y);
   }
 
   @override
@@ -979,6 +1098,14 @@ final class NativeFocusManagerWrapper implements focus.FocusManager {
   }
 
   @override
+  String selectedText() =>
+      safeString(_focusManagerSelectedText(_pointer), deleteNative: true);
+
+  @override
+  bool primaryFocusAcceptsText() =>
+      _focusManagerPrimaryFocusAcceptsText(_pointer);
+
+  @override
   ({double minX, double minY, double maxX, double maxY})? primaryFocusBounds() {
     final minX = calloc<Float>();
     final minY = calloc<Float>();
@@ -1027,6 +1154,35 @@ final class NativeFocusManagerWrapper implements focus.FocusManager {
       _pointer,
       Pointer<Void>.fromAddress(artboardPtr),
     );
+  }
+
+  @override
+  void requestFocus(focus.FocusNode node) {
+    final nodePointer = FocusManagerFFI._getPointer(node);
+    if (nodePointer == null) {
+      return;
+    }
+    _focusManagerRequestFocus(_pointer, nodePointer);
+  }
+
+  @override
+  void requestClearFocus() {
+    _focusManagerRequestClearFocus(_pointer);
+  }
+
+  @override
+  void requestTraversal(int traversalKind) {
+    _focusManagerRequestTraversal(_pointer, traversalKind);
+  }
+
+  @override
+  void processAllPendingFocusRequests() {
+    _focusManagerProcessAllPendingFocusRequests(_pointer);
+  }
+
+  @override
+  void finishAllPendingFocusRequests() {
+    _focusManagerFinishAllPendingFocusRequests(_pointer);
   }
 
   @override

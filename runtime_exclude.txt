@@ -1,13 +1,11 @@
 .github
 .vscode
-cg_renderer
 dev
 rivinfo
 skia
 test
 tests
 viewer
-renderer/webgpu_player/
 
 # Prerequisites
 *.d

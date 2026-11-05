@@ -1,3 +1,5 @@
+import 'package:meta/meta.dart';
+
 import 'src/focus/edge_behavior.dart';
 import 'src/ffi/rive_focus_ffi.dart'
     if (dart.library.js_interop) 'src/web/rive_focus_web.dart';
@@ -111,6 +113,21 @@ abstract class FocusManager {
   /// Clear the current focus.
   void clearFocus();
 
+  /// A primary press began: snapshot the primary focus for [pressEnded].
+  ///
+  /// Called by a state machine controller around pointer dispatch; the
+  /// native state machine does this itself, so apps never call it.
+  // ignore: invalid_internal_annotation
+  @internal
+  void pressBegan();
+
+  /// The press finished dispatching at root artboard position (x, y). Blurs
+  /// the focus [pressBegan] saw if it is still focused, blurs on an outside
+  /// press, and the press missed it.
+  // ignore: invalid_internal_annotation
+  @internal
+  void pressEnded(double x, double y);
+
   /// Check if the given node or any of its descendants has focus.
   bool hasFocus(FocusNode node);
 
@@ -163,6 +180,17 @@ abstract class FocusManager {
   /// Returns true if the input was handled.
   bool textInput(String text);
 
+  /// The selected text of the focused element (e.g. a focused text input's
+  /// current selection). Empty when nothing with a text selection is focused.
+  /// Lets hosts implement clipboard copy/cut, which the runtime can't do
+  /// itself (no system clipboard access).
+  String selectedText();
+
+  /// Whether the focused element (or an ancestor it bubbles to) is a text
+  /// input, i.e. something that consumes typed text. False when nothing is
+  /// focused.
+  bool primaryFocusAcceptsText();
+
   /// Get the world bounds of the primary focus node.
   /// Returns null if there is no focus or the focused node has no bounds.
   /// Bounds are in root artboard space.
@@ -185,6 +213,37 @@ abstract class FocusManager {
   /// the given artboard or a descendant of it.
   /// [artboardPtr] should be a native artboard pointer address.
   bool isFocusInArtboard(int artboardPtr);
+
+  /// Queue-and-retry counterpart of [setFocus], for a focus action.
+  ///
+  /// A focus action runs while the state machine advances, before the update
+  /// pass has refreshed whether the target is focusable, so applying it there
+  /// can reject a target that is perfectly focusable by the time the frame is
+  /// drawn. Queue instead; [processAllPendingFocusRequests] applies it.
+  void requestFocus(FocusNode node);
+
+  /// Queue-and-retry counterpart of [clearFocus]. See [requestFocus].
+  void requestClearFocus();
+
+  /// Queue-and-retry counterpart of the directional focus moves. See
+  /// [requestFocus]. [traversalKind] is 0=next, 1=previous, 2=up, 3=down,
+  /// 4=left, 5=right.
+  void requestTraversal(int traversalKind);
+
+  /// Applies focus changes queued by focus actions, keeping any that can't
+  /// take yet for a later call.
+  ///
+  /// Call once every artboard on this manager has run its update pass:
+  /// whether a focus target is eligible is read from its render opacity and
+  /// collapse state, which that pass computes. Called any earlier it reads
+  /// values that aren't meaningful yet and rejects a perfectly focusable
+  /// target.
+  void processAllPendingFocusRequests();
+
+  /// Finishes the frame: applies what it can and discards the rest, so a
+  /// request for a target that never becomes focusable can't linger and steal
+  /// focus in a later frame.
+  void finishAllPendingFocusRequests();
 
   /// Dispose of this focus manager and release native resources.
   void dispose();

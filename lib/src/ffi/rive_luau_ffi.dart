@@ -305,6 +305,37 @@ final void Function(
         )
         .asFunction();
 
+final void Function(Pointer<Void> state, int index, Pointer<Void> artboard,
+        double xx, double xy, double yx, double yy, double tx, double ty)
+    _riveLuaDrawArtboardToStackRenderer = _nativeLib
+        .lookup<
+            NativeFunction<
+                Void Function(Pointer<Void>, Int32, Pointer<Void>, Float, Float,
+                    Float, Float, Float, Float)>>(
+          'riveLuaDrawArtboardToStackRenderer',
+        )
+        .asFunction();
+
+final void Function(Pointer<Void> state, Pointer<Uint8> data, int size)
+    _riveLuaPushBuffer = _nativeLib
+        .lookup<
+            NativeFunction<
+                Void Function(Pointer<Void>, Pointer<Uint8>, Uint64)>>(
+          'riveLuaPushBuffer',
+        )
+        .asFunction();
+
+final Pointer<Uint8> Function(
+        Pointer<Void> state, int index, Pointer<Uint64> outSize)
+    _riveLuaToBuffer = _nativeLib
+        .lookup<
+            NativeFunction<
+                Pointer<Uint8> Function(
+                    Pointer<Void>, Int32, Pointer<Uint64>)>>(
+          'riveLuaToBuffer',
+        )
+        .asFunction();
+
 final Pointer<Void> Function(
   Pointer<Void> state,
   Pointer<Void> viewModelInstanceValue,
@@ -494,12 +525,31 @@ final Pointer<Void> Function(Pointer<Void> state, int)
         )
         .asFunction();
 
-final Pointer<Void> Function(Pointer<Void> state, int id, double x, double y)
-    _riveLuaPushPointerEvent = _nativeLib
+final Pointer<Void> Function(Pointer<Void> state, int id, double x, double y,
+        int hitType, double timeStamp) _riveLuaPushPointerEvent =
+    _nativeLib
         .lookup<
             NativeFunction<
-                Pointer<Void> Function(Pointer<Void>, Uint8, Float,
-                    Float)>>('riveLuaPushPointerEvent')
+                Pointer<Void> Function(Pointer<Void>, Uint8, Float, Float,
+                    Int32, Float)>>('riveLuaPushPointerEvent')
+        .asFunction();
+
+final Pointer<Void> Function(Pointer<Void> state, int id, double x, double y,
+        double dx, double dy, int phase, bool precise, double timeStamp)
+    _riveLuaPushScrollEvent = _nativeLib
+        .lookup<
+            NativeFunction<
+                Pointer<Void> Function(Pointer<Void>, Int32, Float, Float,
+                    Float, Float, Int32, Bool, Float)>>(
+          'riveLuaPushScrollEvent',
+        )
+        .asFunction();
+
+final int Function(Pointer<Void> event) _riveLuaScrollEventHitResult =
+    _nativeLib
+        .lookup<NativeFunction<Uint8 Function(Pointer<Void>)>>(
+          'riveLuaScrollEventHitResult',
+        )
         .asFunction();
 
 final Pointer<Void> Function(Pointer<Void> state, int id, double x, double y,
@@ -683,6 +733,11 @@ final void Function(Pointer<Void>) _riveLuaClearStateWithFile = nativeLib
     .lookup<NativeFunction<Void Function(Pointer<Void>)>>('clearScriptingVM')
     .asFunction();
 
+final void Function(Pointer<Void>, double) _riveVMDisplayScale = nativeLib
+    .lookup<NativeFunction<Void Function(Pointer<Void>, Float)>>(
+        'riveVMDisplayScale')
+    .asFunction();
+
 final int Function(Pointer<Void> state, Pointer<Void> dataContext)
     _riveLuaPushDataContextViewModel = _nativeLib
         .lookup<NativeFunction<Uint8 Function(Pointer<Void>, Pointer<Void>)>>(
@@ -697,6 +752,20 @@ final int Function(Pointer<Void> state, Pointer<Void> dataContext)
         )
         .asFunction();
 
+final int Function(Pointer<Void> state, Pointer<Void> viewModelInstance)
+    _riveLuaPushViewModelInstance = _nativeLib
+        .lookup<NativeFunction<Uint8 Function(Pointer<Void>, Pointer<Void>)>>(
+          'riveLuaPushViewModelInstance',
+        )
+        .asFunction();
+
+final int Function(Pointer<Void> state, Pointer<Void> file)
+    _riveLuaPushGlobalViewModelNames = _nativeLib
+        .lookup<NativeFunction<Uint8 Function(Pointer<Void>, Pointer<Void>)>>(
+          'riveLuaPushGlobalViewModelNames',
+        )
+        .asFunction();
+
 final void Function(Pointer<Void> state, int timeoutMs)
     _riveLuaSetExecutionTimeout = _nativeLib
         .lookup<NativeFunction<Void Function(Pointer<Void>, Int32)>>(
@@ -704,9 +773,29 @@ final void Function(Pointer<Void> state, int timeoutMs)
         )
         .asFunction();
 
+final void Function(Pointer<Void> state, int tag) _riveLuaSetPropertyOwnerTag =
+    _nativeLib
+        .lookup<NativeFunction<Void Function(Pointer<Void>, Uint32)>>(
+          'riveLuaSetPropertyOwnerTag',
+        )
+        .asFunction();
+
+final void Function(Pointer<Void> state, int tag)
+    _riveLuaDisposeOrphanProperties = _nativeLib
+        .lookup<NativeFunction<Void Function(Pointer<Void>, Uint32)>>(
+          'riveLuaDisposeOrphanProperties',
+        )
+        .asFunction();
+
 final int Function(Pointer<Void> state) _riveLuaGetExecutionTimeout = _nativeLib
     .lookup<NativeFunction<Int32 Function(Pointer<Void>)>>(
       'riveLuaGetExecutionTimeout',
+    )
+    .asFunction();
+
+final bool Function(Pointer<Void> state) _riveLuaBudgetExceeded = _nativeLib
+    .lookup<NativeFunction<Bool Function(Pointer<Void>)>>(
+      'riveLuaBudgetExceeded',
     )
     .asFunction();
 
@@ -775,14 +864,6 @@ final int Function(Pointer<Void> state, int width, int height)
         )
         .asFunction();
 
-// Begins / ends a GPU frame for scripted GPU canvas draw calls.
-final void Function(Pointer<Void>) _riveGPUBeginFrame = _nativeLib
-    .lookup<NativeFunction<Void Function(Pointer<Void>)>>('riveGPUBeginFrame')
-    .asFunction();
-
-final void Function(Pointer<Void>) _riveGPUEndFrame = _nativeLib
-    .lookup<NativeFunction<Void Function(Pointer<Void>)>>('riveGPUEndFrame')
-    .asFunction();
 
 final void Function(
         Pointer<Void> state, Pointer<Utf8> name, Pointer<Uint8> data, int size)
@@ -807,32 +888,6 @@ final int Function(Pointer<Void> state, Pointer<Void> audioSource)
                 )>>('riveLuaPushAudioSource')
         .asFunction();
 
-final void Function(Pointer<Void> state) _riveLuaEnableDrawCanvasPhase =
-    _nativeLib
-        .lookup<
-            NativeFunction<
-                Void Function(
-                  Pointer<Void>,
-                )>>('riveLuaEnableDrawCanvasPhase')
-        .asFunction();
-
-final void Function(Pointer<Void> state) _riveLuaDisableDrawCanvasPhase =
-    _nativeLib
-        .lookup<
-            NativeFunction<
-                Void Function(
-                  Pointer<Void>,
-                )>>('riveLuaDisableDrawCanvasPhase')
-        .asFunction();
-
-final void Function(Pointer<Void> state) _riveLuaAdvanceDetachedViewModels =
-    _nativeLib
-        .lookup<
-            NativeFunction<
-                Void Function(
-                  Pointer<Void>,
-                )>>('riveLuaAdvanceDetachedViewModels')
-        .asFunction();
 
 // Compiles a shader from the in-memory RSTB registry and pushes it as a
 // ScriptedShader userdata. Returns 1 on success, 0 if not found.
@@ -890,7 +945,8 @@ final void Function(Pointer<Void> state) _riveLuaStartPlayback = _nativeLib
             )>>('riveLuaStartPlayback')
     .asFunction();
 
-class LuauStateFFI extends LuauState implements RiveFFIReference {
+class LuauStateFFI extends LuauState
+    implements RiveFFIReference, LuauStateDiagnostics {
   /// Pointer to ScriptingVM* (owns both lua_State and ScriptingContext)
   Pointer<Void> _vmPtr;
 
@@ -949,11 +1005,28 @@ class LuauStateFFI extends LuauState implements RiveFFIReference {
   Pointer<Void> get pointer => _vmPtr;
 
   @override
+  void displayScale(double scale) {
+    _displayScale = scale;
+    if (_vmPtr.address == 0) {
+      return;
+    }
+    _riveVMDisplayScale(_vmPtr, scale);
+  }
+
+  double _displayScale = 1;
+
+  @override
+  double get currentDisplayScale => _displayScale;
+
+  @override
   int get nativeAddress => _vmPtr.address;
 
   @override
   bool get isDisposed =>
       _vmPtr.address == 0 && (_cachedStatePtr?.address ?? 0) == 0;
+
+  @override
+  int get retainedFunctionCount => _nativeCallables.length;
 
   /// For backward compatibility, also expose nativePtr
   @Deprecated('Use pointer instead')
@@ -987,6 +1060,18 @@ class LuauStateFFI extends LuauState implements RiveFFIReference {
     final ffiDataContex = dataContext as FFIRiveInternalDataContext;
     final ptr = ffiDataContex.pointer;
     return _riveLuaPushDataContext(_statePtr, ptr);
+  }
+
+  @override
+  int pushViewModelInstance(InternalViewModelInstance instance) {
+    final ptr = (instance as FFIRiveInternalViewModelInstance).pointer;
+    return _riveLuaPushViewModelInstance(_statePtr, ptr);
+  }
+
+  @override
+  int pushGlobalViewModelNames(File file) {
+    final ptr = (file as RiveFFIReference).pointer;
+    return _riveLuaPushGlobalViewModelNames(_statePtr, ptr);
   }
 
   @override
@@ -1214,6 +1299,45 @@ class LuauStateFFI extends LuauState implements RiveFFIReference {
   }
 
   @override
+  void drawArtboardToStackRenderer(
+      int rendererIndex, Artboard artboard, Mat2D worldTransform) {
+    final pointer = (artboard as RiveFFIReference).pointer;
+    if (pointer.address == 0) {
+      return;
+    }
+    _riveLuaDrawArtboardToStackRenderer(
+        _statePtr,
+        rendererIndex,
+        pointer,
+        worldTransform[0],
+        worldTransform[1],
+        worldTransform[2],
+        worldTransform[3],
+        worldTransform[4],
+        worldTransform[5]);
+  }
+
+  @override
+  void pushBuffer(Uint8List bytes) {
+    final data = calloc<Uint8>(bytes.length);
+    data.asTypedList(bytes.length).setAll(0, bytes);
+    _riveLuaPushBuffer(_statePtr, data, bytes.length);
+    calloc.free(data);
+  }
+
+  @override
+  Uint8List? bufferAt(int index) {
+    final sizeOut = calloc<Uint64>();
+    final data = _riveLuaToBuffer(_statePtr, index, sizeOut);
+    final size = sizeOut.value;
+    calloc.free(sizeOut);
+    if (data == nullptr) {
+      return null;
+    }
+    return Uint8List.fromList(data.asTypedList(size));
+  }
+
+  @override
   void pushViewModelInstanceValue(InternalViewModelInstanceValue value) {
     _riveLuaPushViewModelInstanceValue(
       _statePtr,
@@ -1325,8 +1449,27 @@ class LuauStateFFI extends LuauState implements RiveFFIReference {
       );
 
   @override
-  PointerEvent pushPointerEvent(int id, Vec2D position) => FFIPointerEvent(
-        _riveLuaPushPointerEvent(_statePtr, id, position.x, position.y),
+  PointerEvent pushPointerEvent(int id, Vec2D position,
+          {int hitType = -1, double timeStamp = 0}) =>
+      FFIPointerEvent(
+        _riveLuaPushPointerEvent(
+            _statePtr, id, position.x, position.y, hitType, timeStamp),
+      );
+
+  @override
+  ScriptScrollEvent pushScrollEvent(int id, Vec2D position, ScrollEvent event,
+          {double timeStamp = 0}) =>
+      FFIScriptScrollEvent(
+        _riveLuaPushScrollEvent(
+            _statePtr,
+            id,
+            position.x,
+            position.y,
+            event.delta.x,
+            event.delta.y,
+            event.phase.index,
+            event.precise,
+            timeStamp),
       );
 
   @override
@@ -1575,11 +1718,6 @@ class LuauStateFFI extends LuauState implements RiveFFIReference {
     return _riveLuaPushGPUCanvas(_statePtr, width, height);
   }
 
-  @override
-  void gpuBeginFrame() => _riveGPUBeginFrame(_statePtr);
-
-  @override
-  void gpuEndFrame() => _riveGPUEndFrame(_statePtr);
 
   @override
   RenderPath? renderPath(ScriptedPath scriptedPath, RenderPath path) {
@@ -1588,6 +1726,10 @@ class LuauStateFFI extends LuauState implements RiveFFIReference {
       _statePtr,
       (scriptedPath as FFIScriptedPath).pointer,
     );
+    // pathAt() yields nullptr for anything that isn't a Path/PathData.
+    if (renderPathPointer == nullptr) {
+      return null;
+    }
     final ffRenderPath = rive_renderer.FFIRenderPath.fromPointer(
       riveFactory,
       renderPathPointer,
@@ -1600,7 +1742,18 @@ class LuauStateFFI extends LuauState implements RiveFFIReference {
       _riveLuaSetExecutionTimeout(_statePtr, timeoutMs);
 
   @override
+  void setPropertyOwnerTag(int tag) =>
+      _riveLuaSetPropertyOwnerTag(_statePtr, tag);
+
+  @override
+  void disposeOrphanProperties(int tag) =>
+      _riveLuaDisposeOrphanProperties(_statePtr, tag);
+
+  @override
   int getExecutionTimeout() => _riveLuaGetExecutionTimeout(_statePtr);
+
+  @override
+  bool get budgetExceeded => _riveLuaBudgetExceeded(_statePtr);
 
   @override
   void setGeneratorRef(int assetId, int ref) =>
@@ -1628,20 +1781,6 @@ class LuauStateFFI extends LuauState implements RiveFFIReference {
         _statePtr, (audioSource as AudioSourceFFI).nativePtr);
   }
 
-  @override
-  void enableDrawCanvasPhase() {
-    _riveLuaEnableDrawCanvasPhase(_statePtr);
-  }
-
-  @override
-  void disableDrawCanvasPhase() {
-    _riveLuaDisableDrawCanvasPhase(_statePtr);
-  }
-
-  @override
-  void advanceDetachedViewModels() {
-    _riveLuaAdvanceDetachedViewModels(_statePtr);
-  }
 
   @override
   int pushShader(String name) {
@@ -1716,6 +1855,15 @@ class FFIPointerEvent extends PointerEvent {
   @override
   HitResult get hitResult =>
       HitResult.values[_riveLuaPointerEventHitResult(pointer)];
+}
+
+class FFIScriptScrollEvent extends ScriptScrollEvent {
+  final Pointer<Void> pointer;
+  FFIScriptScrollEvent(this.pointer);
+
+  @override
+  HitResult get hitResult =>
+      HitResult.values[_riveLuaScrollEventHitResult(pointer)];
 }
 
 class FFIScriptedDataValue extends ScriptedDataValue {

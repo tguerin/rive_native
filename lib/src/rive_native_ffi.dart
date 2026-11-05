@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:ffi';
+import 'dart:io' as io;
 import 'dart:ui' as ui;
 
 import 'package:ffi/ffi.dart';
@@ -11,6 +12,9 @@ import 'package:rive_native/platform.dart';
 import 'package:flutter/widgets.dart' hide Key;
 import 'package:flutter/widgets.dart' as flutter show Key;
 import 'package:rive_native/rive_native.dart';
+import 'package:rive_native/src/deferred_session_factory.dart';
+import 'package:rive_native/src/ffi/rive_deferred_ffi.dart'
+    show bindDeferredSessionRenderContext;
 import 'package:rive_native/src/ffi/dynamic_library_helper.dart';
 import 'package:rive_native/src/ffi/rive_renderer_ffi.dart';
 import 'package:rive_native/src/rive.dart' as rive;
@@ -23,6 +27,41 @@ final bool Function(Pointer<Void>, bool, int) _nativeClear = nativeLib
     .asFunction();
 final bool Function(Pointer<Void>, double) _nativeFlush = nativeLib
     .lookup<NativeFunction<Bool Function(Pointer<Void>, Float)>>('flush')
+    .asFunction();
+
+final void Function(Pointer<Void>, Pointer<Void>) _textureUseDeferredSession =
+    nativeLib
+        .lookup<NativeFunction<Void Function(Pointer<Void>, Pointer<Void>)>>(
+            'riveTextureUseDeferredSession')
+        .asFunction();
+// Pause and resume ship only on iOS, so null when absent.
+final void Function(Pointer<Void>)? _textureDeferredPause =
+    nativeLib.providesSymbol('riveTextureDeferredPause')
+        ? nativeLib
+            .lookup<NativeFunction<Void Function(Pointer<Void>)>>(
+                'riveTextureDeferredPause')
+            .asFunction()
+        : null;
+final void Function(Pointer<Void>)? _textureDeferredResume =
+    nativeLib.providesSymbol('riveTextureDeferredResume')
+        ? nativeLib
+            .lookup<NativeFunction<Void Function(Pointer<Void>)>>(
+                'riveTextureDeferredResume')
+            .asFunction()
+        : null;
+final int Function(Pointer<Void>)? _deferredCanAccept =
+    nativeLib.providesSymbol('riveDeferredCanAccept')
+        ? nativeLib
+            .lookup<NativeFunction<Int32 Function(Pointer<Void>)>>(
+                'riveDeferredCanAccept')
+            .asFunction()
+        : null;
+// Android-only per-texture pacing gate. A lazy final, so a platform that
+// never reads it never resolves the symbol. Not a leaf call: in hardware
+// buffer mode it also pushes a finished frame to Flutter through JNI.
+final int Function(Pointer<Void>) _textureCanAcceptDeferredFrame = nativeLib
+    .lookup<NativeFunction<Int32 Function(Pointer<Void>)>>(
+        'riveTextureCanAcceptDeferredFrame')
     .asFunction();
 final Pointer<Void> Function(Pointer<Void>) _nativeTexture = nativeLib
     .lookup<NativeFunction<Pointer<Void> Function(Pointer<Void>)>>(
@@ -77,12 +116,83 @@ base class _NativeRenderTexture extends RenderTexture {
   int get textureId => _textureId;
 
   @override
-  Pointer<Void> get nativeTexture => _nativeTexture(_rendererPtr);
+  Pointer<Void> get nativeTexture =>
+      _rendererPtr == nullptr ? nullptr : _nativeTexture(_rendererPtr);
 
   final MethodChannel methodChannel;
   int _textureId = -1;
   Pointer<Void> _rendererPtr = nullptr;
   bool _disposed = false;
+
+  rive.Factory? _deferredFactory;
+  Pointer<Void> _deferredSession = nullptr;
+  bool _deferredPaused = false;
+  // Session the current native renderer was given, so per-frame re-attach
+  // skips the FFI call.
+  int _appliedSessionAddress = 0;
+
+  @override
+  void useDeferredSession(rive.Factory? session) {
+    final sessionAddress = deferredSessionAddress(session);
+    if (sessionAddress == _appliedSessionAddress) {
+      return;
+    }
+    final previous = _deferredFactory;
+    if (previous != null) {
+      forgetDeferredAttachedTexture(previous, this);
+    }
+    _appliedSessionAddress = sessionAddress;
+    _deferredFactory = sessionAddress == 0 ? null : session;
+    _deferredSession = Pointer<Void>.fromAddress(sessionAddress);
+    if (session != null && sessionAddress != 0) {
+      setDeferredAttachedTexture(session, this);
+    }
+    _textureUseDeferredSession(_rendererPtr, _deferredSession);
+    // Give the session the process render context it replays against, so native
+    // off-screen canvases (cache-as-bitmap) can allocate on the right context.
+    // Idempotent; no-op on detach or an already-bound (context) session.
+    bindDeferredSessionRenderContext(session);
+  }
+
+  /// Drain and hold the render thread so no GPU work is submitted while
+  /// backgrounded. iOS only since only iOS forbids background GPU work.
+  void pauseDeferred() {
+    if (_deferredFactory != null && _rendererPtr != nullptr) {
+      _deferredPaused = true;
+      _textureDeferredPause?.call(_rendererPtr);
+    }
+  }
+
+  /// Resume deferred rendering after [pauseDeferred].
+  void resumeDeferred() {
+    _deferredPaused = false;
+    if (_deferredFactory != null && _rendererPtr != nullptr) {
+      _textureDeferredResume?.call(_rendererPtr);
+    }
+  }
+
+  @override
+  bool get deferredPaused => _deferredPaused;
+
+  @override
+  bool get canAcceptDeferredFrame {
+    if (_deferredSession == nullptr) {
+      return true;
+    }
+    if (io.Platform.isAndroid) {
+      // Per texture: a session-global budget starves whichever textures tick
+      // last.
+      if (_rendererPtr == nullptr) {
+        return true; // No renderer yet, nothing can be in flight.
+      }
+      return _textureCanAcceptDeferredFrame(_rendererPtr) != 0;
+    }
+    final canAccept = _deferredCanAccept;
+    if (canAccept == null) {
+      return true;
+    }
+    return canAccept(_deferredSession) != 0;
+  }
 
   _NativeRenderTexture(this.methodChannel);
 
@@ -92,6 +202,17 @@ base class _NativeRenderTexture extends RenderTexture {
   @override
   void dispose() {
     _disposed = true;
+    // The native texture is destroyed on a delay, when removeTexture lands, so
+    // drop the pointer now: anything that still calls in (the pacing gate, a
+    // late clear) then sees a disposed texture instead of reaching a freed one.
+    _leaveSessionAndDropHost();
+    removeAllTextureChangedListeners();
+    final factory = _deferredFactory;
+    if (factory != null) {
+      forgetDeferredAttachedTexture(factory, this);
+    }
+    _deferredFactory = null;
+    _deferredSession = nullptr;
     if (_textureId != -1) {
       _allTextures.remove(_textureId);
       _disposeTexture(_textureId);
@@ -150,6 +271,8 @@ base class _NativeRenderTexture extends RenderTexture {
     final result = await methodChannel.invokeMethod('createTexture', {
       'width': width == 0 ? 1 : width,
       'height': height == 0 ? 1 : height,
+      // Android reads it; the other platforms ignore it.
+      'hardwareBuffers': RiveNative.androidHardwareBuffers,
     });
     int? textureId = result['textureId'] as int?;
     // Disposed while the platform call was in flight: the texture it just
@@ -163,6 +286,8 @@ base class _NativeRenderTexture extends RenderTexture {
     _actualWidth = width;
     _actualHeight = height;
     String renderer = result['renderer'] as String;
+    // The new renderer never saw the session, the next attach must cross FFI.
+    _leaveSessionAndDropHost();
     _rendererPtr = Pointer<Void>.fromAddress(
         int.parse(renderer.substring(renderer.indexOf('x') + 1), radix: 16));
 
@@ -189,8 +314,19 @@ base class _NativeRenderTexture extends RenderTexture {
   }) =>
       _RiveNativeView(this, painter, resolution, key: key);
 
-  void _markDestroyed() {
+  // The host leaves its session here, on the recording thread, before the
+  // pointer goes: the platform frees the host later, off this thread, and must
+  // not touch session state. Until then its target stays in the session.
+  void _leaveSessionAndDropHost() {
+    if (_appliedSessionAddress != 0 && _rendererPtr != nullptr) {
+      _textureUseDeferredSession(_rendererPtr, nullptr);
+    }
     _rendererPtr = nullptr;
+    _appliedSessionAddress = 0;
+  }
+
+  void _markDestroyed() {
+    _leaveSessionAndDropHost();
     final textureIdToDestroy = _textureId;
     if (textureIdToDestroy != -1) {
       _textureId = -1;
@@ -221,7 +357,8 @@ base class _NativeRenderTexture extends RenderTexture {
   }
 
   @override
-  Renderer get renderer => FFIRiveRenderer(rive.Factory.rive, _rendererPtr);
+  Renderer get renderer =>
+      FFIRiveRenderer(_deferredFactory ?? rive.Factory.rive, _rendererPtr);
 
   @override
   Future<ui.Image> toImage() {
@@ -351,16 +488,62 @@ base class _HeadlessRenderTexture extends RenderTexture {
   }
 }
 
+// Newer than some prebuilt libraries; null there.
+final void Function(double)? _setOffscreenDisplayScale =
+    nativeLib.providesSymbol('setOffscreenDisplayScale')
+    ? nativeLib
+          .lookup<NativeFunction<Void Function(Float)>>(
+            'setOffscreenDisplayScale',
+          )
+          .asFunction()
+    : null;
+
 class _RiveNativeFFI extends RiveNative {
   final methodChannel = const MethodChannel('rive_native');
   Pointer<Void> _headlessContext = nullptr;
+  rive.Factory? _headlessFactory;
 
   @override
-  RenderTexture makeRenderTexture() {
+  void setRasterDisplayScale(double scale) =>
+      _setOffscreenDisplayScale?.call(scale);
+
+  @override
+  RenderTexture makeRenderTexture({bool deferred = false}) {
     if (Platform.instance.isTesting && _headlessContext != nullptr) {
       return _HeadlessRenderTexture(_headlessContext);
     }
     return _NativeRenderTexture(methodChannel);
+  }
+
+  /// Test mode creates the context at initialize; other modes on demand,
+  /// when the build carries the headless symbols. Process lifetime, like the
+  /// render context.
+  Pointer<Void> get _bakeContext {
+    if (_headlessContext == nullptr &&
+        nativeLib.providesSymbol('createHeadlessContext')) {
+      _headlessContext = _createHeadlessContext(true);
+    }
+    return _headlessContext;
+  }
+
+  @override
+  RenderTexture? makeHeadlessRenderTexture() =>
+      _bakeContext == nullptr ? null : _HeadlessRenderTexture(_bakeContext);
+
+  @override
+  rive.Factory? get headlessRiveFactory {
+    final cached = _headlessFactory;
+    if (cached != null) {
+      return cached;
+    }
+    if (_bakeContext == nullptr) {
+      return null;
+    }
+    final factoryPtr = _headlessContextFactory(_bakeContext);
+    if (factoryPtr == nullptr) {
+      return null;
+    }
+    return _headlessFactory = FFIHeadlessFactory(factoryPtr);
   }
 
   Future<void> initialize() async {
@@ -379,7 +562,7 @@ class _RiveNativeFFI extends RiveNative {
       if (_headlessContext != nullptr) {
         final factoryPtr = _headlessContextFactory(_headlessContext);
         if (factoryPtr != nullptr) {
-          (rive.Factory.rive as FFIRiveFactory).pointer = factoryPtr;
+          FFIRiveFactory.instance.pointer = factoryPtr;
         }
       }
       return;
@@ -395,13 +578,35 @@ class _RiveNativeFFI extends RiveNative {
               'riveFactory',
             )
             .asFunction();
-        (rive.Factory.rive as FFIRiveFactory).pointer = riveFactory();
+        final factoryPtr = riveFactory();
+        if (factoryPtr == nullptr) {
+          _riveRendererUnavailable('the native riveFactory() returned null');
+          return;
+        }
+        FFIRiveFactory.instance.pointer = factoryPtr;
       } else {
-        (rive.Factory.rive as FFIRiveFactory).pointer =
-            Pointer<Void>.fromAddress(int.parse(
-                rendererContext.substring(rendererContext.indexOf('x') + 1),
-                radix: 16));
+        final address = _parseRenderContextAddress(rendererContext);
+        if (address == 0) {
+          // Every desktop plugin formats this with `%p`, so a missing render
+          // context arrives as "0x0" / "0000000000000000" / "(nil)" rather
+          // than as an error. Leaving the factory null here is what used to
+          // crash later, inside File::import, with no hint of why.
+          _riveRendererUnavailable(
+              'the platform reported no render context ("$rendererContext")');
+          return;
+        }
+        FFIRiveFactory.instance.pointer = Pointer<Void>.fromAddress(address);
       }
+    } on PlatformException catch (e) {
+      if (e.code == _kRiveRendererUnavailable) {
+        // The renderer is unsupported on this device (no GPU adapter, no D3D
+        // device, ...). That is not a setup problem, and it must not take
+        // startup down with it: leave Factory.rive unsupported so callers can
+        // fall back to Factory.flutter.
+        _riveRendererUnavailable(e.message ?? 'reason not reported');
+        return;
+      }
+      rethrow;
     } catch (e) {
       var message = '''
 Error creating Rive Native render context
@@ -416,6 +621,28 @@ Error: $e
       rethrow;
     }
   }
+}
+
+/// Error code the desktop plugins report when they have no render context to
+/// hand back. Keep in sync with the native plugins.
+const String _kRiveRendererUnavailable = 'rive-renderer-unavailable';
+
+/// Parses the pointer string a plugin formatted with `%p`, which differs per
+/// platform: "0x7ffd..." (Apple/glibc), "00007FFD..." (MSVC, no prefix) and
+/// "(nil)" (glibc, null). Returns 0 for anything that is not a live address,
+/// including an unparseable reply.
+int _parseRenderContextAddress(String rendererContext) {
+  final text = rendererContext.trim();
+  final xIndex = text.indexOf('x');
+  final digits = xIndex == -1 ? text : text.substring(xIndex + 1);
+  return int.tryParse(digits, radix: 16) ?? 0;
+}
+
+void _riveRendererUnavailable(String reason) {
+  // Loud and greppable: Factory.rive stays unsupported for the process, so
+  // anything that decodes a file through it gets nothing back.
+  debugPrint('Rive renderer unavailable on this device: $reason. '
+      'Factory.rive will not decode files; use Factory.flutter instead.');
 }
 
 Future<RiveNative?> makeRiveNative() async {
@@ -477,9 +704,17 @@ class _RiveNativeViewRenderObject extends RiveNativeRenderBox
   void didChangeAppLifecycleState(AppLifecycleState state) {
     super.didChangeAppLifecycleState(state);
 
+    final texture = renderTexture;
     if (state == AppLifecycleState.resumed) {
+      if (texture is _NativeRenderTexture) {
+        texture.resumeDeferred();
+      }
       restartTickerIfStopped();
       markNeedsLayout();
+    } else if (io.Platform.isIOS && texture is _NativeRenderTexture) {
+      // Only iOS forbids background GPU work. Pause while access is still
+      // legal, inactive fires before the background transition.
+      texture.pauseDeferred();
     }
   }
 

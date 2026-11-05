@@ -15,9 +15,12 @@ import 'package:rive_native/rive_native.dart';
 import 'package:rive_native/src/wasm_version.dart';
 import 'package:rive_native/src/web/layout_engine_web.dart';
 import 'package:rive_native/src/web/rive_audio_web.dart';
+import 'package:rive_native/src/web/rive_deferred_web.dart';
 import 'package:rive_native/src/web/rive_focus_web.dart';
 import 'package:rive_native/src/web/rive_semantic_web.dart';
 import 'package:rive_native/src/web/rive_luau_web.dart';
+import 'package:rive_native/src/web/rive_wasm_web.dart';
+import 'package:rive_native/src/web/rive_markup_web.dart';
 import 'package:rive_native/src/web/rive_pathops_web.dart';
 import 'package:rive_native/src/web/rive_renderer_web.dart';
 import 'package:rive_native/src/web/rive_text_web.dart';
@@ -68,29 +71,57 @@ base class _WebRenderTexture extends RenderTexture {
 
   static final js.JSString _isContextLostKey = 'isContextLost'.toJS;
 
+  // False once the browser has refused this canvas a context, which is how a
+  // widget goes blank instead of the page throwing every frame.
   @override
-  bool get isReady => canvasElement.isConnected && !_contextLost;
+  bool get isReady =>
+      canvasElement.isConnected && !_contextRefused && !_liveContextLost;
 
-  /// Whether the WebGL context backing this texture is gone — released, or
-  /// evicted by the browser (context pressure, GPU reset). GL calls against
-  /// a lost context are silently ignored, so painting it renders nothing.
-  bool get _contextLost {
+  /// Whether a claimed main-thread WebGL context has been lost — evicted by
+  /// the browser (context pressure, GPU reset). GL calls against a lost
+  /// context are silently ignored, so painting it renders nothing. A texture
+  /// that never claimed one, or whose canvas lives on the replay worker, has
+  /// no main-thread context to lose.
+  bool get _liveContextLost {
     final gl = _gl;
-    return gl == null || gl.callMethod<js.JSBoolean>(_isContextLostKey).toDart;
+    return gl != null && gl.callMethod<js.JSBoolean>(_isContextLostKey).toDart;
   }
 
-  /// Disposed textures kept for reuse. A pooled texture keeps its canvas and
-  /// live WebGL2 context, and browsers cap live contexts (~16 per process) —
-  /// so the pool is bounded and dispose genuinely releases beyond the cap.
-  /// The cap covers realistic churn bursts (route pops, editor pane
-  /// closures) without pinning a whole page's high-water mark forever.
+  // Canvases that have never been transferred. Any consumer can take one: it
+  // can still claim a main-thread context or hand itself to the replay
+  // worker. Bounded because a pooled texture may hold a live WebGL2 context
+  // and browsers cap those (~16 per process), so dispose genuinely releases
+  // beyond the cap.
   static const int _maxPoolSize = 4;
   static final List<_WebRenderTexture> _pool = [];
 
-  static _WebRenderTexture make() {
+  // Canvases already handed to the replay worker. Such a canvas can never take
+  // a main-thread context again, so only a deferred consumer may have one —
+  // it arrives with a live worker renderer, which is repointed at the new
+  // session. Without this list every deferred widget lifecycle stranded one
+  // canvas and one worker GL context for the life of the page, and the
+  // browser's live-context budget ran out after a handful of them.
+  static final List<_WebRenderTexture> _deferredPool = [];
+
+  // How many idle transferred canvases are worth keeping. Each one holds a
+  // worker GL context, and the browser gives a page about sixteen in total
+  // (Flutter's own CanvasKit surfaces included), so a page that once showed
+  // many Rive widgets must not go on paying for them.
+  static const int _maxIdleDeferredTextures = 4;
+
+  static _WebRenderTexture make({bool deferred = false}) {
+    if (deferred && _deferredPool.isNotEmpty) {
+      return _deferredPool.removeAt(0);
+    }
     while (_pool.isNotEmpty) {
       final pooled = _pool.removeAt(0);
-      if (!pooled._contextLost) {
+      if (!pooled._liveContextLost) {
+        // A prior headless consumer may have hidden and fixed-sized it.
+        pooled.canvasElement.style
+          ..position = ''
+          ..visibility = ''
+          ..width = '100%'
+          ..height = '100%';
         _debugLogTexture('${pooled.rendererId} reused from pool');
         return pooled;
       }
@@ -107,14 +138,14 @@ base class _WebRenderTexture extends RenderTexture {
       ..style.width = '100%';
     html.document.body!.append(canvasElement);
 
-    final renderer = RiveWasm.makeRenderer.callAsFunction(null, canvasElement);
-    assert(renderer != null && renderer.isA<js.JSObject>());
-
-    final texture = _WebRenderTexture(
-      renderer as js.JSObject,
-      canvasElement,
-      id,
-    );
+    // A deferred consumer's renderer is created lazily: claiming a main GL
+    // context here would block the OffscreenCanvas transfer to the worker.
+    final texture = _WebRenderTexture(null, canvasElement, id);
+    if (!deferred) {
+      // An immediate consumer claims its context now, so every live texture
+      // holds one and the pool bound genuinely bounds live contexts.
+      texture.ensureImmediateRenderer();
+    }
     // Create the observer
     final web.ResizeObserver observer = web.ResizeObserver(
       (
@@ -190,24 +221,58 @@ base class _WebRenderTexture extends RenderTexture {
 
   @override
   void dispose() {
-    final alreadyDisposed = isDisposed || _pool.contains(this);
+    final alreadyDisposed =
+        isDisposed || _pool.contains(this) || _deferredPool.contains(this);
     assert(!alreadyDisposed, 'RenderTexture disposed twice');
     if (alreadyDisposed) {
       return;
+    }
+    // Pooling hands this same object to the next consumer; listeners must
+    // not cross that boundary.
+    removeAllTextureChangedListeners();
+    // The budget may have room again by the time this canvas is reused.
+    _contextRefused = false;
+    if (_canvasTransferred) {
+      // The session this canvas was replaying is about to be deleted, so point
+      // the worker renderer at nothing first. Both cross to the replay worker
+      // through the same FIFO post queue, so the detach is ordered ahead of
+      // the delete without the main thread waiting on either.
+      useDeferredSession(null);
+      // An idle transferred canvas still holds a worker GL context, and the
+      // browser's budget for those is small. Past the point where reuse is
+      // plausible, hand the renderer and its context back instead.
+      if (_deferredPool.length >= _maxIdleDeferredTextures &&
+          _retireWorkerRenderer()) {
+        canvasElement.remove();
+        return;
+      }
+      resetBackingPolicy();
+      // Its canvas cannot be resized from here or transferred again, so park
+      // it where only another deferred consumer can take it.
+      _deferredPool.add(this);
+      return;
+    }
+    if (_deferredSessionAddress != 0) {
+      // Inline replay bound the session to this renderer's contexts.
+      // Releasing or reusing the renderer while bound leaves the session
+      // pointing at deleted GL state, which crashes the next replay.
+      useDeferredSession(null);
     }
     canvasElement.width = canvasElement.height = 0;
     resetBackingPolicy();
     // A lost context never recovers on its own — pooling it would hand a
     // dead texture to the next consumer.
-    final contextLost = _contextLost;
+    final contextLost = _liveContextLost;
     if (_pool.length < _maxPoolSize && !contextLost) {
       _pool.add(this);
       _debugLogTexture('$rendererId disposed → pooled');
       return;
     }
     _release();
-    _debugLogTexture('$rendererId disposed → released '
-        '(${contextLost ? 'context lost' : 'pool full'})');
+    _debugLogTexture(
+      '$rendererId disposed → released '
+      '(${contextLost ? 'context lost' : 'pool full'})',
+    );
   }
 
   /// Genuinely destroys this texture: the native renderer, the browser's
@@ -218,6 +283,13 @@ base class _WebRenderTexture extends RenderTexture {
   void _release() {
     _resizeObserver?.disconnect();
     _resizeObserver = null;
+    if (_deferredSessionAddress != 0 && jsRenderContext != null) {
+      // Never delete a renderer a session is still bound to.
+      webDeferredAbandonOpenTargets(_deferredSessionAddress);
+      webRendererUseDeferredSession(jsRenderContextPtr, 0);
+      _deferredSessionAddress = 0;
+      _deferredFactory = null;
+    }
     final ctx = jsRenderContext;
     if (ctx != null) {
       RiveWasm.releaseRenderer.callAsFunction(null, ctx);
@@ -225,6 +297,7 @@ base class _WebRenderTexture extends RenderTexture {
     jsRenderContext = null;
     jsRenderContextPtr = null;
     _gl = null;
+    _released = true;
     canvasElement.remove();
   }
 
@@ -237,6 +310,20 @@ base class _WebRenderTexture extends RenderTexture {
     _pool.clear();
   }
 
+  /// Retires idle worker renderers and their GL contexts. A renderer the
+  /// worker is still creating refuses retirement and stays pooled.
+  static void releaseDeferredPool() {
+    _deferredPool.removeWhere((texture) {
+      if (!texture._retireWorkerRenderer()) {
+        return false;
+      }
+      texture._resizeObserver?.disconnect();
+      texture._resizeObserver = null;
+      texture.canvasElement.remove();
+      return true;
+    });
+  }
+
   @override
   Widget widget({
     RenderTexturePainter? painter,
@@ -247,13 +334,170 @@ base class _WebRenderTexture extends RenderTexture {
         children: [
           Positioned.fill(child: HtmlElementView(viewType: rendererId)),
           Positioned.fill(
-              child: _RiveNativeWebView(this, painter, resolution, key: key)),
+            child: _RiveNativeWebView(this, painter, resolution, key: key),
+          ),
         ],
       );
 
+  Factory? _deferredFactory;
+  // Draws record here even before the worker renderer is ready.
+  int _deferredSessionAddress = 0;
+  // The main thread cannot resize a canvas transferred to the worker.
+  bool _canvasTransferred = false;
+
+  // Set when the browser refused a WebGL2 context for this canvas. Sticky for
+  // the texture's current life so a refusal costs one attempt rather than one
+  // per frame; cleared when it goes back in the pool.
+  bool _contextRefused = false;
+
+  // Null once the canvas is transferred: the GL context, ore context, and
+  // render context all belong to the replay worker and cannot be used here.
+  js.JSObject? get immediateRenderer {
+    if (_canvasTransferred || !ensureImmediateRenderer()) {
+      return null;
+    }
+    return jsRenderContext;
+  }
+
+  /// Whether a renderer is available, creating a main-thread one if this
+  /// canvas has none. No-op once any renderer, immediate or worker, exists.
+  ///
+  /// Returns false when the browser refused a context. Callers must honour
+  /// that: an exhausted budget used to escape as an uncaught throw out of a
+  /// frame callback and out of `File.dispose`, which killed the app's own
+  /// teardown. A blank widget and a warning is the better failure.
+  bool ensureImmediateRenderer() {
+    if (jsRenderContext != null) {
+      return true;
+    }
+    if (_contextRefused) {
+      return false;
+    }
+    final renderer = RiveWasm.makeRenderer.callAsFunction(null, canvasElement);
+    if (renderer == null || !renderer.isA<js.JSObject>()) {
+      _contextRefused = true;
+      debugPrint(
+        'rive_native: the browser refused a WebGL2 context, so this Rive '
+        'widget will stay blank. The page has too many live WebGL contexts.',
+      );
+      return false;
+    }
+    jsRenderContext = renderer as js.JSObject;
+    jsRenderContextPtr = jsRenderContext!.getProperty('_ptr'.toJS);
+    final gl = jsRenderContext!.getProperty('_gl'.toJS);
+    _gl = gl != null && gl.isA<js.JSObject>() ? gl as js.JSObject : null;
+    // The new context has default backing policy, the next sync must push.
+    _backingPolicy = null;
+    return true;
+  }
+
+  // Repoint the worker has not acknowledged yet, retried from
+  // canAcceptDeferredFrame which polls every frame.
+  int? _pendingRepoint;
+
+  bool _repointWorkerRenderer(int sessionAddress) {
+    final fn = RiveWasm.redeferWorkerRenderer;
+    final context = jsRenderContext;
+    if (fn == null || context == null) {
+      return true; // nothing to repoint
+    }
+    final ok = fn.callAsFunction(null, context, sessionAddress.toJS);
+    return (ok as js.JSBoolean).toDart;
+  }
+
+  /// Gives the worker renderer and the GL context it owns back to the browser.
+  /// The renderer outlives any one session, so this is the only point at which
+  /// releasing it is safe. False while the worker is still creating it, in
+  /// which case the texture stays pooled and is retired on a later pass.
+  bool _retireWorkerRenderer() {
+    final fn = RiveWasm.deleteDeferredWorkerRenderer;
+    final context = jsRenderContext;
+    if (fn == null || context == null) {
+      return false;
+    }
+    final ok = fn.callAsFunction(null, context);
+    if (ok == null || !ok.isA<js.JSBoolean>() || !(ok as js.JSBoolean).toDart) {
+      return false;
+    }
+    jsRenderContext = null;
+    jsRenderContextPtr = null;
+    return true;
+  }
+
+  @override
+  void useDeferredSession(Factory? session) {
+    final sessionAddress = deferredSessionAddress(session);
+    final factory = session;
+    // A live renderer already has this session, per-frame re-attach is free.
+    if (sessionAddress == _deferredSessionAddress && jsRenderContext != null) {
+      return;
+    }
+    // Leaving a session: drop the back-pointer naming this pooled (never
+    // isDisposed) texture, else it blocks the next attach.
+    final previous = _deferredFactory;
+    if (previous != null && !identical(previous, factory)) {
+      forgetDeferredAttachedTexture(previous, this);
+    }
+    if (factory != null && sessionAddress != 0) {
+      setDeferredAttachedTexture(factory, this);
+    }
+    // Leaving a session, to none or to another: neither the worker detach nor
+    // the inline one closes a frame this texture left open there.
+    if (_deferredSessionAddress != sessionAddress) {
+      webDeferredAbandonOpenTargets(_deferredSessionAddress);
+    }
+    if (_canvasTransferred) {
+      // The canvas cannot transfer twice, so reuse the worker renderer and
+      // repoint it at the new session.
+      _deferredFactory = sessionAddress == 0 ? null : factory;
+      _deferredSessionAddress = sessionAddress;
+      _pendingRepoint =
+          _repointWorkerRenderer(sessionAddress) ? null : sessionAddress;
+      return;
+    }
+    _deferredFactory = sessionAddress == 0 ? null : factory;
+    _deferredSessionAddress = sessionAddress;
+    if (sessionAddress == 0) {
+      // Detaching needs no renderer of its own. Creating one here is what
+      // turned a context shortage into a failed File.dispose(): the throw came
+      // out of the dispose call, so the app never finished tearing down.
+      if (jsRenderContext != null) {
+        webRendererUseDeferredSession(jsRenderContextPtr, 0);
+      }
+      return;
+    }
+    // Transfer the canvas to the replay worker. Attach happens in C during
+    // setup, so no webRendererUseDeferredSession call. A canvas that already
+    // holds a rendering context cannot transfer — the spec forbids it — so
+    // fall through to inline replay rather than raise InvalidStateError.
+    final workerFn = RiveWasm.makeDeferredWorkerRenderer;
+    if (workerFn != null && jsRenderContext == null) {
+      final result = workerFn.callAsFunction(
+        null,
+        canvasElement,
+        sessionAddress.toJS,
+      );
+      if (result != null && result.isA<js.JSObject>()) {
+        jsRenderContext = result as js.JSObject;
+        // The ptr resolves on the worker, so draws and flush route through
+        // the renderer object instead.
+        jsRenderContextPtr = null;
+        // The worker stub has default backing policy, the next sync must push.
+        _backingPolicy = null;
+        _canvasTransferred = true;
+        return;
+      }
+    }
+    // Fall back to inline replay on the main thread.
+    if (!ensureImmediateRenderer()) {
+      return;
+    }
+    webRendererUseDeferredSession(jsRenderContextPtr, sessionAddress);
+  }
+
   @override
   bool clear(Color color, [bool write = true]) {
-    if (isDisposed) {
+    if (isDisposed || !ensureImmediateRenderer()) {
       return false;
     }
     RiveWasm.clearRenderer
@@ -264,10 +508,11 @@ base class _WebRenderTexture extends RenderTexture {
 
   @override
   bool flush(double devicePixelRatio) {
-    if (isDisposed) {
+    if (isDisposed || !ensureImmediateRenderer()) {
       return false;
     }
-    RiveWasm.flushRenderer.callAsFunction(null, jsRenderContextPtr);
+    // flushRenderer takes the renderer object and resolves the ptr itself.
+    RiveWasm.flushRenderer.callAsFunction(null, jsRenderContext);
     return true;
   }
 
@@ -275,7 +520,23 @@ base class _WebRenderTexture extends RenderTexture {
   dynamic get nativeTexture => null;
 
   @override
-  Renderer get renderer => WebRiveRenderer(jsRenderContextPtr, Factory.rive);
+  Renderer get renderer {
+    // Draws record into the session even before the worker is ready.
+    final sessionScreen = RiveWasm.deferredSessionScreenRenderer;
+    if (_deferredSessionAddress != 0 && sessionScreen != null) {
+      final drawPtr = sessionScreen.callAsFunction(
+        null,
+        _deferredSessionAddress.toJS,
+      );
+      return WebRiveRenderer(drawPtr, _deferredFactory ?? Factory.rive);
+    }
+    ensureImmediateRenderer();
+    final drawPtr = RiveWasm.rendererDrawRenderer.callAsFunction(
+      null,
+      jsRenderContextPtr,
+    );
+    return WebRiveRenderer(drawPtr, _deferredFactory ?? Factory.rive);
+  }
 
   @override
   Future<ui.Image> toImage() {
@@ -294,8 +555,11 @@ base class _WebRenderTexture extends RenderTexture {
 
   // Pooled textures are not "disposed" — the same object is handed back out
   // by make(). Only a genuine release is terminal.
+  // A texture with no renderer yet is not disposed, it is lazy: a deferred
+  // consumer must find the canvas context free so it can transfer.
+  bool _released = false;
   @override
-  bool get isDisposed => jsRenderContext == null;
+  bool get isDisposed => _released;
 
   @override
   int get actualWidth => canvasElement.width;
@@ -303,12 +567,86 @@ base class _WebRenderTexture extends RenderTexture {
   int get actualHeight => canvasElement.height;
 
   @override
-  Future<void> makeRenderTexture(int width, int height) {
-    throw UnimplementedError();
+  Future<void> makeRenderTexture(int width, int height) async {
+    // Headless baking: no layout ever sizes this canvas, so keep it out of
+    // view and let the fixed policy size the backing store on clear.
+    canvasElement.style
+      ..position = 'absolute'
+      ..visibility = 'hidden'
+      ..width = '${width}px'
+      ..height = '${height}px';
+    if (!ensureImmediateRenderer()) {
+      return;
+    }
+    setBackingPolicy(
+      fixedWidth: width,
+      fixedHeight: height,
+      scaleX: 1,
+      scaleY: 1,
+      maxLogical: 0,
+    );
   }
 
   @override
   bool needsResize(int width, int height) => false;
+
+  // A transferred canvas renders on the worker into its own bitmap, so DOM
+  // visibility is irrelevant; an inline one opens its screen from the live
+  // canvas and needs it displayed with real size.
+  @override
+  bool get hasVisibleBacking =>
+      _canvasTransferred ||
+      (canvasElement.isConnected &&
+          canvasElement.clientWidth > 0 &&
+          canvasElement.clientHeight > 0);
+
+  @override
+  bool get canAcceptDeferredFrame {
+    // A pending repoint must land before any frame records against the new
+    // session.
+    final pending = _pendingRepoint;
+    if (pending != null) {
+      if (!_repointWorkerRenderer(pending)) {
+        return false;
+      }
+      _pendingRepoint = null;
+    }
+    // Only the worker replay path can fall behind.
+    if (_deferredSessionAddress == 0 || !_canvasTransferred) {
+      return true;
+    }
+    // Recording before the worker renderer exists would merge several paints
+    // into one frame that cannot legally replay as one. This call also pumps
+    // the resolve along.
+    final readyFn = RiveWasm.deferredRendererReady;
+    if (readyFn != null) {
+      final ready =
+          (readyFn.callAsFunction(null, jsRenderContext) as js.JSNumber)
+              .toDartInt;
+      if (ready < 0) {
+        // Terminal: the worker could not create its renderer. Refuse like a
+        // denied context so the widget goes cleanly blank instead of
+        // scheduling forever.
+        if (!_contextRefused) {
+          _contextRefused = true;
+          debugPrint(
+            'rive_native: the replay worker could not create its renderer, '
+            'so this Rive widget will stay blank.',
+          );
+        }
+        return false;
+      }
+      if (ready == 0) {
+        return false;
+      }
+    }
+    final fn = RiveWasm.deferredCanAccept;
+    if (fn == null) {
+      return true;
+    }
+    final r = fn.callAsFunction(null, _deferredSessionAddress.toJS);
+    return (r as js.JSNumber).toDartInt != 0;
+  }
 }
 
 /// Forces the loss of the WebGL context backing [texture] via the
@@ -342,15 +680,18 @@ void _debugLogTexture(String message) {
     live =
         ((fn as js.JSFunction).callAsFunction(null) as js.JSNumber).toDartInt;
   }
-  debugPrint('[Rive] $message — live contexts: $live '
-      '(pooled: ${_WebRenderTexture._pool.length})');
+  debugPrint(
+    '[Rive] $message — live contexts: $live '
+    '(pooled: ${_WebRenderTexture._pool.length})',
+  );
 }
 
 /// Extracts the WebGL context handle from a web [RenderTexture].
-/// Returns 0 if the texture is null or not a web render texture.
+/// Returns 0 if the texture is null, not a web render texture, or backed by
+/// the replay worker.
 int webGLHandleFromRenderTexture(RenderTexture? texture) {
   if (texture is! _WebRenderTexture) return 0;
-  final renderer = texture.jsRenderContext;
+  final renderer = texture.immediateRenderer;
   if (renderer == null) return 0;
   final handle = renderer.getProperty('_handle'.toJS);
   if (handle == null || !handle.isA<js.JSNumber>()) return 0;
@@ -358,10 +699,11 @@ int webGLHandleFromRenderTexture(RenderTexture? texture) {
 }
 
 /// Extracts the ore::Context* pointer from a web [RenderTexture].
-/// Returns 0 if the texture is null or not a web render texture.
+/// Returns 0 if the texture is null, not a web render texture, or backed by
+/// the replay worker.
 int webOreCtxPtrFromRenderTexture(RenderTexture? texture) {
   if (texture is! _WebRenderTexture) return 0;
-  final renderer = texture.jsRenderContext;
+  final renderer = texture.immediateRenderer;
   if (renderer == null) return 0;
   final ptr = renderer.getProperty('_oreCtxPtr'.toJS);
   if (ptr == null || !ptr.isA<js.JSNumber>()) return 0;
@@ -369,10 +711,11 @@ int webOreCtxPtrFromRenderTexture(RenderTexture? texture) {
 }
 
 /// Extracts the gpu::RenderContext* pointer from a web [RenderTexture].
-/// Returns 0 if the texture is null or not a web render texture.
+/// Returns 0 if the texture is null, not a web render texture, or backed by
+/// the replay worker.
 int webRenderCtxPtrFromRenderTexture(RenderTexture? texture) {
   if (texture is! _WebRenderTexture) return 0;
-  final renderer = texture.jsRenderContext;
+  final renderer = texture.immediateRenderer;
   if (renderer == null) return 0;
   final ptr = renderer.getProperty('_renderCtxPtr'.toJS);
   if (ptr == null || !ptr.isA<js.JSNumber>()) return 0;
@@ -430,6 +773,15 @@ class RiveWasm {
   static late js.JSFunction makeRenderer;
   static late js.JSFunction releaseRenderer;
   static late js.JSFunction releaseOffscreenGL;
+  // Null on single threaded builds where replay falls back to inline.
+  static js.JSFunction? makeDeferredWorkerRenderer;
+  static js.JSFunction? redeferWorkerRenderer;
+  static js.JSFunction? deleteDeferredWorkerRenderer;
+  static js.JSFunction? deferredCanAccept;
+  static js.JSFunction? deferredRendererReady;
+  static js.JSFunction? deferredSessionScreenRenderer;
+  static late js.JSFunction rendererDrawRenderer;
+  static late js.JSFunction deleteRenderer;
   static late js.JSFunction deleteFlutterRenderer;
   static late js.JSFunction flushRenderer;
   static late js.JSFunction clearRenderer;
@@ -569,10 +921,33 @@ class RiveWasm {
   static late js.JSFunction makeRenderPaint;
   static late js.JSFunction deleteRenderPaint;
   static late js.JSFunction updatePaint;
+  static late js.JSFunction paintModulatedImage;
+  // Optional: absent from wasm builds that predate artboard paint sources,
+  // in which case a paint filled with an artboard draws without the image.
+  static js.JSFunction? paintModulatedArtboard;
+  static js.JSFunction? artboardPaintSourceMake;
+  static js.JSFunction? artboardPaintSourceDelete;
+  static js.JSFunction? artboardPaintSourceAdvance;
+  static js.JSFunction? artboardPaintSourceBounds;
+  static js.JSFunction? artboardPaintSourceSetDataContext;
+  static js.JSFunction? artboardPaintSourceUpdateDataBinds;
   static late js.JSFunction drawPath;
   static late js.JSFunction drawImage;
   static late js.JSFunction drawImageMesh;
+  static late js.JSFunction drawImageMeshInstanced;
+  static late js.JSFunction makeImageMeshInstances;
+  static late js.JSFunction editImageMeshInstances;
+  static late js.JSFunction endEditImageMeshInstances;
+  static late js.JSFunction deleteImageMeshInstances;
   static late js.JSFunction clipPath;
+  // Layer masking (renderer_binding.cpp). Looked up tolerantly, like the FFI
+  // side: a wasm that predates them degrades to "no masking" instead of
+  // failing to link.
+  static js.JSFunction? rendererAcquireMaskHandle;
+  static js.JSFunction? rendererReleaseMask;
+  static js.JSFunction? rendererBeginMask;
+  static js.JSFunction? rendererBeginMaskSource;
+  static js.JSFunction? rendererEndMask;
   static late js.JSFunction _heapViewU8;
   static late js.JSFunction _heapViewF32;
   static late js.JSFunction _heapViewU16;
@@ -602,12 +977,19 @@ class RiveWasm {
   static late js.JSFunction riveFileAssetSetAudioSource;
   static late js.JSFunction deleteRiveFile;
   static js.JSFunction? riveFileSetScriptingVM;
+  static js.JSFunction? riveFileStartScripts;
+  // Absent from builds made before the wasm scripts' frame service.
+  static js.JSFunction? riveFileFrameBoundary;
+  static js.JSObject? riveScripting;
   static late js.JSFunction deleteFileAsset;
   static js.JSFunction? requestSerializedViewModelInstance;
   static late js.JSFunction clearRuntimeViewModelInstances;
   static late js.JSFunction riveFileArtboardDefault;
   static late js.JSFunction riveFileArtboardNamed;
   static late js.JSFunction riveFileArtboardByIndex;
+  // Present only in tools builds; see WITH_RIVE_TOOLS in rive_binding.cpp.
+  static js.JSFunction? riveFileReplaceArtboard;
+  static js.JSFunction? riveFileArtboardByteRange;
   static late js.JSFunction riveFileArtboardToBindNamed;
   static late js.JSFunction riveFileViewModelCount;
   static late js.JSFunction riveFileViewModelRuntimeByIndex;
@@ -660,15 +1042,23 @@ class RiveWasm {
   static late js.JSFunction vmiValueRuntimeHasChanged;
   static late js.JSFunction vmiValueRuntimeClearChanges;
   static late js.JSFunction artboardSetVMIRuntime;
-  static late js.JSFunction stateMachineSetVMIRuntime;
+  static late js.JSFunction riveFileGlobalViewModelCount;
+  static late js.JSFunction riveFileGlobalViewModelName;
+  static late js.JSFunction riveFileArtboardCount;
+  static late js.JSFunction riveFileArtboardName;
+  static late js.JSFunction stateMachineSetMainVMIRuntime;
+  static late js.JSFunction stateMachineSetGlobalVMIRuntime;
+  static late js.JSFunction stateMachineBind;
+  static late js.JSFunction stateMachineGlobalVMIRuntime;
+  static late js.JSFunction stateMachineMainVMIRuntime;
+  static late js.JSFunction stateMachineGlobalVMINativeInstance;
+  static late js.JSFunction stateMachineMainVMINativeInstance;
+  static late js.JSFunction vmiRuntimeNativeInstance;
   static late js.JSFunction deleteVMIValueRuntime;
   static late js.JSFunction deleteVMIRuntime;
   static late js.JSFunction deleteViewModelRuntime;
   static late js.JSFunction artboardDraw;
-  static late js.JSFunction artboardDrawCanvases;
-  static late js.JSFunction artboardGetDrawCanvasLuauState;
   static late js.JSFunction artboardDrawInternal;
-  static late js.JSFunction artboardReset;
   static late js.JSFunction artboardName;
   static late js.JSFunction artboardGetInnerPointer;
   static late js.JSFunction deleteArtboardInstance;
@@ -681,6 +1071,12 @@ class RiveWasm {
   static late js.JSFunction componentGetWorldTransform;
   static late js.JSFunction componentSetWorldTransform;
   static late js.JSFunction artboardGetRenderTransform;
+  // Newer than some prebuilt modules; null there, which draws undeformed.
+  static js.JSFunction? artboardMeshUVTransform;
+  static js.JSFunction? artboardDrawThroughMesh;
+  static js.JSFunction? artboardSelfTransform;
+  static js.JSFunction? artboardRasterResolution;
+  static js.JSFunction? setOffscreenDisplayScale;
   static late js.JSFunction artboardSetRenderTransform;
   static late js.JSFunction componentGetScaleX;
   static late js.JSFunction componentSetScaleX;
@@ -696,6 +1092,7 @@ class RiveWasm {
   static late js.JSFunction artboardAnimationNamed;
   static late js.JSFunction artboardSetFrameOrigin;
   static late js.JSFunction artboardGetFrameOrigin;
+  static late js.JSFunction artboardDidChange;
   static late js.JSFunction animationInstanceName;
   static late js.JSFunction animationInstanceAdvance;
   static late js.JSFunction animationInstanceApply;
@@ -746,6 +1143,13 @@ class RiveWasm {
   static late js.JSFunction stateMachineInstancePointerUp;
   static late js.JSFunction stateMachineInstancePointerMove;
   static late js.JSFunction stateMachineInstancePointerExit;
+  static late js.JSFunction stateMachineInstancePointerScroll;
+  static late js.JSFunction stateMachineInstanceWantsScroll;
+  static late js.JSFunction stateMachineInstanceHasScrollTargetAt;
+  static late js.JSFunction stateMachineInstanceListensToButtonAt;
+  static late js.JSFunction stateMachineInstanceScrollOccludedAt;
+  static late js.JSFunction stateMachineInstanceHasScrollLatch;
+  static late js.JSFunction stateMachineInstanceCancelScroll;
   static late js.JSFunction stateMachineInstanceDragStart;
   static late js.JSFunction stateMachineInstanceDragEnd;
   static late js.JSFunction stateMachineInstanceSubmitGamepadsFromBuffer;
@@ -774,8 +1178,6 @@ class RiveWasm {
   static late js.JSFunction setBooleanValue;
   static late js.JSFunction stateMachineInstanceTrigger;
   static late js.JSFunction fireTrigger;
-  static late js.JSFunction stateMachineInstanceBatchAdvance;
-  static late js.JSFunction stateMachineInstanceBatchAdvanceAndRender;
   static late js.JSFunction artboardSetText;
   static late js.JSFunction artboardGetText;
   static late js.JSFunction artboardGetAllTextRuns;
@@ -792,6 +1194,9 @@ class RiveWasm {
   static late js.JSFunction artboardWidthOverride;
   static late js.JSFunction artboardHeightOverride;
   static late js.JSFunction artboardParentIsRow;
+  static late js.JSFunction artboardParentIsStack;
+  // Null on a wasm build older than this binding.
+  static js.JSFunction? artboardVirtualGridCell;
   static late js.JSFunction artboardWidthIntrinsicallySizeOverride;
   static late js.JSFunction artboardHeightIntrinsicallySizeOverride;
   static late js.JSFunction updateLayoutBounds;
@@ -819,12 +1224,12 @@ class RiveWasm {
   static late js.JSFunction setViewModelInstanceColorValue;
   static late js.JSFunction setViewModelInstanceStringValue;
   static late js.JSFunction setViewModelInstanceBooleanValue;
-  static late js.JSFunction setViewModelInstanceTriggerValue;
+  static late js.JSFunction fireViewModelInstanceTrigger;
   static late js.JSFunction setViewModelInstanceAssetValue;
+  static late js.JSFunction viewModelInstanceAssetImageRenderImage;
   static late js.JSFunction viewModelInstanceAssetImageResolveRuntimeIndex;
   static late js.JSFunction viewModelInstanceAssetFontResolveRuntimeIndex;
   static late js.JSFunction setViewModelInstanceArtboardValue;
-  static late js.JSFunction setViewModelInstanceAdvanced;
   static late js.JSFunction setViewModelInstanceEnumValue;
   static late js.JSFunction setViewModelInstanceSymbolListIndexValue;
   static late js.JSFunction setViewModelInstanceListValue;
@@ -856,6 +1261,7 @@ class RiveWasm {
   static late js.JSFunction setViewModelInstanceViewModelValue;
   static late js.JSFunction setViewModelInstanceViewModelCallback;
   static late js.JSFunction initBindingCallbacks;
+  static late js.JSFunction? initInterpolatorCallbacks;
 
   // Focus-related artboard/state machine functions
   // These require WITH_RIVE_TOOLS (editor builds only)
@@ -865,6 +1271,8 @@ class RiveWasm {
   static late js.JSFunction artboardBuildFocusTreeWithParent;
   static late js.JSFunction stateMachineGetFocusManager;
   static late js.JSFunction stateMachineSetExternalFocusManager;
+  static late js.JSFunction stateMachineHasFocusNodes;
+  static late js.JSFunction stateMachineFocusState;
 
   static late js.JSFunction makeRawText;
   static late js.JSFunction deleteRawText;
@@ -901,10 +1309,26 @@ class RiveWasm {
   static late js.JSFunction rawTextInputSetSizing;
   static late js.JSFunction rawTextInputGetOverflow;
   static late js.JSFunction rawTextInputSetOverflow;
+  static late js.JSFunction rawTextInputGetAlign;
+  static late js.JSFunction rawTextInputSetAlign;
+  static late js.JSFunction rawTextInputGetAlignWidth;
+  static late js.JSFunction rawTextInputSetAlignWidth;
+  static late js.JSFunction rawTextInputGetVerticalAlign;
+  static late js.JSFunction rawTextInputSetVerticalAlign;
+  static late js.JSFunction rawTextInputGetAlignHeight;
+  static late js.JSFunction rawTextInputSetAlignHeight;
   static late js.JSFunction rawTextInputGetSelectionCornerRadius;
   static late js.JSFunction rawTextInputSetSelectionCornerRadius;
   static late js.JSFunction rawTextInputGetSeparateSelectionText;
   static late js.JSFunction rawTextInputSetSeparateSelectionText;
+  static late js.JSFunction rawTextInputGetObscured;
+  static late js.JSFunction rawTextInputSetObscured;
+  static late js.JSFunction rawTextInputGetMaxCharacters;
+  static late js.JSFunction rawTextInputSetMaxCharacters;
+  static late js.JSFunction rawTextInputGetMaxLines;
+  static late js.JSFunction rawTextInputSetMaxLines;
+  static late js.JSFunction rawTextInputGetHugsWidth;
+  static late js.JSFunction rawTextInputSetHugsWidth;
   static late js.JSFunction rawTextInputGetText;
   static late js.JSFunction rawTextInputSetText;
   static late js.JSFunction rawTextInputSetTextPreserveCursor;
@@ -969,6 +1393,17 @@ class RiveWasm {
     makeRenderer = module['makeRenderer'] as js.JSFunction;
     releaseRenderer = module['releaseRenderer'] as js.JSFunction;
     releaseOffscreenGL = module['releaseOffscreenGL'] as js.JSFunction;
+    makeDeferredWorkerRenderer =
+        module['makeDeferredWorkerRenderer'] as js.JSFunction?;
+    redeferWorkerRenderer = module['redeferWorkerRenderer'] as js.JSFunction?;
+    deleteDeferredWorkerRenderer =
+        module['deleteDeferredWorkerRenderer'] as js.JSFunction?;
+    deferredSessionScreenRenderer =
+        module['_riveDeferredSessionScreenRenderer'] as js.JSFunction?;
+    deferredCanAccept = module['_riveDeferredCanAccept'] as js.JSFunction?;
+    deferredRendererReady = module['deferredRendererReady'] as js.JSFunction?;
+    rendererDrawRenderer = module['rendererDrawRenderer'] as js.JSFunction;
+    deleteRenderer = module['deleteRenderer'] as js.JSFunction;
     flushRenderer = module['flushRenderer'] as js.JSFunction;
     clearRenderer = module['clearRenderer'] as js.JSFunction;
     saveRenderer = module['saveRenderer'] as js.JSFunction;
@@ -995,10 +1430,39 @@ class RiveWasm {
     makeRenderPaint = module['_makeRenderPaint'] as js.JSFunction;
     deleteRenderPaint = module['_deleteRenderPaint'] as js.JSFunction;
     updatePaint = module['_updatePaint'] as js.JSFunction;
+    paintModulatedImage = module['_paintModulatedImage'] as js.JSFunction;
+    paintModulatedArtboard =
+        module['_paintModulatedArtboard'] as js.JSFunction?;
+    artboardPaintSourceMake =
+        module['_artboardPaintSourceMake'] as js.JSFunction?;
+    artboardPaintSourceDelete =
+        module['_artboardPaintSourceDelete'] as js.JSFunction?;
+    artboardPaintSourceAdvance =
+        module['_artboardPaintSourceAdvance'] as js.JSFunction?;
+    artboardPaintSourceBounds =
+        module['_artboardPaintSourceBounds'] as js.JSFunction?;
+    artboardPaintSourceSetDataContext =
+        module['_artboardPaintSourceSetDataContext'] as js.JSFunction?;
+    artboardPaintSourceUpdateDataBinds =
+        module['_artboardPaintSourceUpdateDataBinds'] as js.JSFunction?;
     drawPath = module['_drawPath'] as js.JSFunction;
     drawImage = module['_drawImage'] as js.JSFunction;
     drawImageMesh = module['_drawImageMesh'] as js.JSFunction;
+    drawImageMeshInstanced = module['_drawImageMeshInstanced'] as js.JSFunction;
+    makeImageMeshInstances = module['_makeImageMeshInstances'] as js.JSFunction;
+    editImageMeshInstances = module['_editImageMeshInstances'] as js.JSFunction;
+    endEditImageMeshInstances =
+        module['_endEditImageMeshInstances'] as js.JSFunction;
+    deleteImageMeshInstances =
+        module['_deleteImageMeshInstances'] as js.JSFunction;
     clipPath = module['_clipPath'] as js.JSFunction;
+    rendererAcquireMaskHandle =
+        module['_rendererAcquireMaskHandle'] as js.JSFunction?;
+    rendererReleaseMask = module['_rendererReleaseMask'] as js.JSFunction?;
+    rendererBeginMask = module['_rendererBeginMask'] as js.JSFunction?;
+    rendererBeginMaskSource =
+        module['_rendererBeginMaskSource'] as js.JSFunction?;
+    rendererEndMask = module['_rendererEndMask'] as js.JSFunction?;
     trimPathEffectPath = module['_trimPathEffectPath'] as js.JSFunction;
     makeTrimPathEffect = module['_makeTrimPathEffect'] as js.JSFunction;
     deleteTrimPathEffect = module['_deleteTrimPathEffect'] as js.JSFunction;
@@ -1056,6 +1520,10 @@ class RiveWasm {
     deleteRiveFile = module['_deleteRiveFile'] as js.JSFunction;
     riveFileSetScriptingVM =
         module['_riveFileSetScriptingVM'] as js.JSFunction?;
+    // Only builds with the wasm script module backend carry these.
+    riveFileStartScripts = module['_riveFileStartScripts'] as js.JSFunction?;
+    riveFileFrameBoundary = module['_riveFileFrameBoundary'] as js.JSFunction?;
+    riveScripting = module['riveScripting'] as js.JSObject?;
     clearRuntimeViewModelInstances =
         module['_clearRuntimeViewModelInstances'] as js.JSFunction;
     requestSerializedViewModelInstance =
@@ -1081,6 +1549,11 @@ class RiveWasm {
     riveFileArtboardNamed = module['_riveFileArtboardNamed'] as js.JSFunction;
     riveFileArtboardByIndex =
         module['_riveFileArtboardByIndex'] as js.JSFunction;
+    // Nullable: a runtime build without WITH_RIVE_TOOLS does not export these.
+    riveFileReplaceArtboard =
+        module['_riveFileReplaceArtboard'] as js.JSFunction?;
+    riveFileArtboardByteRange =
+        module['_riveFileArtboardByteRange'] as js.JSFunction?;
     riveFileArtboardToBindNamed =
         module['_riveFileArtboardToBindNamed'] as js.JSFunction;
     riveFileViewModelCount = module['_riveFileViewModelCount'] as js.JSFunction;
@@ -1174,17 +1647,32 @@ class RiveWasm {
     vmiValueRuntimeClearChanges =
         module['_vmiValueRuntimeClearChanges'] as js.JSFunction;
     artboardSetVMIRuntime = module['_artboardSetVMIRuntime'] as js.JSFunction;
-    stateMachineSetVMIRuntime =
-        module['_stateMachineSetVMIRuntime'] as js.JSFunction;
+    riveFileGlobalViewModelCount =
+        module['_riveFileGlobalViewModelCount'] as js.JSFunction;
+    riveFileGlobalViewModelName =
+        module['_riveFileGlobalViewModelName'] as js.JSFunction;
+    riveFileArtboardCount = module['_riveFileArtboardCount'] as js.JSFunction;
+    riveFileArtboardName = module['_riveFileArtboardName'] as js.JSFunction;
+    stateMachineSetMainVMIRuntime =
+        module['_stateMachineSetMainVMIRuntime'] as js.JSFunction;
+    stateMachineSetGlobalVMIRuntime =
+        module['_stateMachineSetGlobalVMIRuntime'] as js.JSFunction;
+    stateMachineBind = module['_stateMachineBind'] as js.JSFunction;
+    stateMachineGlobalVMIRuntime =
+        module['_stateMachineGlobalVMIRuntime'] as js.JSFunction;
+    stateMachineMainVMIRuntime =
+        module['_stateMachineMainVMIRuntime'] as js.JSFunction;
+    stateMachineGlobalVMINativeInstance =
+        module['_stateMachineGlobalVMINativeInstance'] as js.JSFunction;
+    stateMachineMainVMINativeInstance =
+        module['_stateMachineMainVMINativeInstance'] as js.JSFunction;
+    vmiRuntimeNativeInstance =
+        module['_vmiRuntimeNativeInstance'] as js.JSFunction;
     deleteVMIValueRuntime = module['_deleteVMIValueRuntime'] as js.JSFunction;
     deleteVMIRuntime = module['_deleteVMIRuntime'] as js.JSFunction;
     deleteViewModelRuntime = module['_deleteViewModelRuntime'] as js.JSFunction;
     artboardDraw = module['_artboardDraw'] as js.JSFunction;
-    artboardDrawCanvases = module['_artboardDrawCanvases'] as js.JSFunction;
-    artboardGetDrawCanvasLuauState =
-        module['_artboardGetDrawCanvasLuauState'] as js.JSFunction;
     artboardDrawInternal = module['_artboardDrawInternal'] as js.JSFunction;
-    artboardReset = module['_artboardReset'] as js.JSFunction;
     artboardName = module['_artboardName'] as js.JSFunction;
     artboardGetInnerPointer =
         module['_artboardGetInnerPointer'] as js.JSFunction;
@@ -1203,6 +1691,15 @@ class RiveWasm {
         module['_componentSetWorldTransform'] as js.JSFunction;
     artboardGetRenderTransform =
         module['_artboardGetRenderTransform'] as js.JSFunction;
+    artboardMeshUVTransform =
+        module['_artboardMeshUVTransform'] as js.JSFunction?;
+    artboardDrawThroughMesh =
+        module['_artboardDrawThroughMesh'] as js.JSFunction?;
+    artboardSelfTransform = module['_artboardSelfTransform'] as js.JSFunction?;
+    artboardRasterResolution =
+        module['_artboardRasterResolution'] as js.JSFunction?;
+    setOffscreenDisplayScale =
+        module['_setOffscreenDisplayScale'] as js.JSFunction?;
     artboardSetRenderTransform =
         module['_artboardSetRenderTransform'] as js.JSFunction;
     componentGetScaleX = module['_componentGetScaleX'] as js.JSFunction;
@@ -1220,6 +1717,7 @@ class RiveWasm {
     artboardAnimationNamed = module['_artboardAnimationNamed'] as js.JSFunction;
     artboardSetFrameOrigin = module['_artboardSetFrameOrigin'] as js.JSFunction;
     artboardGetFrameOrigin = module['_artboardGetFrameOrigin'] as js.JSFunction;
+    artboardDidChange = module['_artboardDidChange'] as js.JSFunction;
     animationInstanceName = module['_animationInstanceName'] as js.JSFunction;
     animationInstanceAdvance =
         module['_animationInstanceAdvance'] as js.JSFunction;
@@ -1314,6 +1812,20 @@ class RiveWasm {
         module['_stateMachineInstancePointerMove'] as js.JSFunction;
     stateMachineInstancePointerExit =
         module['_stateMachineInstancePointerExit'] as js.JSFunction;
+    stateMachineInstancePointerScroll =
+        module['_stateMachineInstancePointerScroll'] as js.JSFunction;
+    stateMachineInstanceWantsScroll =
+        module['_stateMachineInstanceWantsScroll'] as js.JSFunction;
+    stateMachineInstanceHasScrollTargetAt =
+        module['_stateMachineInstanceHasScrollTargetAt'] as js.JSFunction;
+    stateMachineInstanceListensToButtonAt =
+        module['_stateMachineInstanceListensToButtonAt'] as js.JSFunction;
+    stateMachineInstanceScrollOccludedAt =
+        module['_stateMachineInstanceScrollOccludedAt'] as js.JSFunction;
+    stateMachineInstanceHasScrollLatch =
+        module['_stateMachineInstanceHasScrollLatch'] as js.JSFunction;
+    stateMachineInstanceCancelScroll =
+        module['_stateMachineInstanceCancelScroll'] as js.JSFunction;
     stateMachineInstanceDragStart =
         module['_stateMachineInstanceDragStart'] as js.JSFunction;
     stateMachineInstanceDragEnd =
@@ -1358,10 +1870,6 @@ class RiveWasm {
     stateMachineInstanceTrigger =
         module['_stateMachineInstanceTrigger'] as js.JSFunction;
     fireTrigger = module['_fireTrigger'] as js.JSFunction;
-    stateMachineInstanceBatchAdvance =
-        module['_stateMachineInstanceBatchAdvance'] as js.JSFunction;
-    stateMachineInstanceBatchAdvanceAndRender =
-        module['_stateMachineInstanceBatchAdvanceAndRender'] as js.JSFunction;
     artboardSetText = module['_artboardSetText'] as js.JSFunction;
     artboardGetText = module['_artboardGetText'] as js.JSFunction;
     artboardGetAllTextRuns = module['artboardGetAllTextRuns'] as js.JSFunction;
@@ -1379,6 +1887,9 @@ class RiveWasm {
     artboardWidthOverride = module['_artboardWidthOverride'] as js.JSFunction;
     artboardHeightOverride = module['_artboardHeightOverride'] as js.JSFunction;
     artboardParentIsRow = module['_artboardParentIsRow'] as js.JSFunction;
+    artboardParentIsStack = module['_artboardParentIsStack'] as js.JSFunction;
+    artboardVirtualGridCell =
+        module['_artboardVirtualGridCell'] as js.JSFunction?;
     artboardWidthIntrinsicallySizeOverride =
         module['_artboardWidthIntrinsicallySizeOverride'] as js.JSFunction;
     artboardHeightIntrinsicallySizeOverride =
@@ -1424,10 +1935,12 @@ class RiveWasm {
         module['_setViewModelInstanceStringValue'] as js.JSFunction;
     setViewModelInstanceBooleanValue =
         module['_setViewModelInstanceBooleanValue'] as js.JSFunction;
-    setViewModelInstanceTriggerValue =
-        module['_setViewModelInstanceTriggerValue'] as js.JSFunction;
+    fireViewModelInstanceTrigger =
+        module['_fireViewModelInstanceTrigger'] as js.JSFunction;
     setViewModelInstanceAssetValue =
         module['_setViewModelInstanceAssetValue'] as js.JSFunction;
+    viewModelInstanceAssetImageRenderImage =
+        module['_viewModelInstanceAssetImageRenderImage'] as js.JSFunction;
     viewModelInstanceAssetImageResolveRuntimeIndex =
         module['_viewModelInstanceAssetImageResolveRuntimeIndex']
             as js.JSFunction;
@@ -1436,8 +1949,6 @@ class RiveWasm {
             as js.JSFunction;
     setViewModelInstanceArtboardValue =
         module['_setViewModelInstanceArtboardValue'] as js.JSFunction;
-    setViewModelInstanceAdvanced =
-        module['_setViewModelInstanceAdvanced'] as js.JSFunction;
     setViewModelInstanceEnumValue =
         module['_setViewModelInstanceEnumValue'] as js.JSFunction;
     setViewModelInstanceSymbolListIndexValue =
@@ -1492,6 +2003,8 @@ class RiveWasm {
     setViewModelInstanceViewModelCallback =
         module['_setViewModelInstanceViewModelCallback'] as js.JSFunction;
     initBindingCallbacks = module['initBindingCallbacks'] as js.JSFunction;
+    initInterpolatorCallbacks =
+        module['initInterpolatorCallbacks'] as js.JSFunction?;
 
     // Focus-related artboard/state machine functions
     artboardRootFocusDataCount =
@@ -1506,6 +2019,9 @@ class RiveWasm {
         module['_stateMachineGetFocusManager'] as js.JSFunction;
     stateMachineSetExternalFocusManager =
         module['_stateMachineSetExternalFocusManager'] as js.JSFunction;
+    stateMachineHasFocusNodes =
+        module['_stateMachineHasFocusNodes'] as js.JSFunction;
+    stateMachineFocusState = module['_stateMachineFocusState'] as js.JSFunction;
 
     deleteDashPathEffect = module['_deleteDashPathEffect'] as js.JSFunction;
     makeDashPathEffect = module['_makeDashPathEffect'] as js.JSFunction;
@@ -1582,6 +2098,20 @@ class RiveWasm {
         module['_rawTextInputGetOverflow'] as js.JSFunction;
     rawTextInputSetOverflow =
         module['_rawTextInputSetOverflow'] as js.JSFunction;
+    rawTextInputGetAlign = module['_rawTextInputGetAlign'] as js.JSFunction;
+    rawTextInputSetAlign = module['_rawTextInputSetAlign'] as js.JSFunction;
+    rawTextInputGetAlignWidth =
+        module['_rawTextInputGetAlignWidth'] as js.JSFunction;
+    rawTextInputSetAlignWidth =
+        module['_rawTextInputSetAlignWidth'] as js.JSFunction;
+    rawTextInputGetVerticalAlign =
+        module['_rawTextInputGetVerticalAlign'] as js.JSFunction;
+    rawTextInputSetVerticalAlign =
+        module['_rawTextInputSetVerticalAlign'] as js.JSFunction;
+    rawTextInputGetAlignHeight =
+        module['_rawTextInputGetAlignHeight'] as js.JSFunction;
+    rawTextInputSetAlignHeight =
+        module['_rawTextInputSetAlignHeight'] as js.JSFunction;
     rawTextInputGetSelectionCornerRadius =
         module['_rawTextInputGetSelectionCornerRadius'] as js.JSFunction;
     rawTextInputSetSelectionCornerRadius =
@@ -1590,6 +2120,22 @@ class RiveWasm {
         module['_rawTextInputGetSeparateSelectionText'] as js.JSFunction;
     rawTextInputSetSeparateSelectionText =
         module['_rawTextInputSetSeparateSelectionText'] as js.JSFunction;
+    rawTextInputGetObscured =
+        module['_rawTextInputGetObscured'] as js.JSFunction;
+    rawTextInputSetObscured =
+        module['_rawTextInputSetObscured'] as js.JSFunction;
+    rawTextInputGetMaxCharacters =
+        module['_rawTextInputGetMaxCharacters'] as js.JSFunction;
+    rawTextInputSetMaxCharacters =
+        module['_rawTextInputSetMaxCharacters'] as js.JSFunction;
+    rawTextInputGetMaxLines =
+        module['_rawTextInputGetMaxLines'] as js.JSFunction;
+    rawTextInputSetMaxLines =
+        module['_rawTextInputSetMaxLines'] as js.JSFunction;
+    rawTextInputGetHugsWidth =
+        module['_rawTextInputGetHugsWidth'] as js.JSFunction;
+    rawTextInputSetHugsWidth =
+        module['_rawTextInputSetHugsWidth'] as js.JSFunction;
     rawTextInputGetText = module['_rawTextInputGetText'] as js.JSFunction;
     rawTextInputSetText = module['_rawTextInputSetText'] as js.JSFunction;
     rawTextInputSetTextPreserveCursor =
@@ -1674,14 +2220,22 @@ extension StringUtf8Wasm on String {
 
 class _WebRiveNative extends RiveNative {
   @override
-  RenderTexture makeRenderTexture() => _WebRenderTexture.make();
+  RenderTexture makeRenderTexture({bool deferred = false}) =>
+      _WebRenderTexture.make(deferred: deferred);
+
+  @override
+  void setRasterDisplayScale(double scale) =>
+      RiveWasm.setOffscreenDisplayScale?.callAsFunction(null, scale.toJS);
 
   /// Destroys the pooled render textures and the shared offscreen probe,
   /// each of which holds a live WebGL context (browsers cap those at ~16
-  /// per process) — an idle page drops to zero live contexts.
+  /// per process) — an idle page drops to zero live contexts. Idle worker
+  /// renderers are retired too; one the worker is still creating stays
+  /// pooled and retires on a later pass.
   @override
   void releaseRenderResources() {
     _WebRenderTexture.releasePool();
+    _WebRenderTexture.releaseDeferredPool();
     RiveWasm.releaseOffscreenGL.callAsFunction(null);
     _debugLogTexture('released pooled textures and offscreen probe');
   }
@@ -1732,11 +2286,24 @@ Future<RiveNative?> _loadWasm(String source, String name) async {
       final module = moduleAny as js.JSObject;
       RiveWasm.link(module);
       LayoutEngineWasm.link(module);
+      DeferredWasm.link(module);
       if (!isRuntimeEnvironment) {
-        // Add scripting workspace for the Editor
-        ScriptingWorkspaceWasm.link(module);
-        LuauStateWasm.link(module);
+        // Editor bindings. Leaner wasm builds omit some of them, so gate each
+        // on its exports like the FFI providesSymbol guards. PathOps guards
+        // itself.
+        if (module.hasProperty('makeScriptingWorkspace'.toJS).toDart) {
+          ScriptingWorkspaceWasm.link(module);
+        }
+        if (riveScriptingLuau &&
+            module.hasProperty('riveVMCreate'.toJS).toDart) {
+          LuauStateWasm.link(module);
+        }
+        if (riveScriptingWasm &&
+            module.hasProperty('riveWasmVMBoot'.toJS).toDart) {
+          WasmScriptingWeb.link(module);
+        }
         PathOpsWasm.link(module);
+        MarkupWasm.link(module);
       }
       TextEngine.link(module);
       AudioEngineWasm.link(module);
@@ -1769,8 +2336,12 @@ class _RiveNativeWebView extends LeafRenderObjectWidget {
   final _WebRenderTexture renderTexture;
   final RenderTexturePainter? painter;
   final RenderResolution resolution;
-  const _RiveNativeWebView(this.renderTexture, this.painter, this.resolution,
-      {super.key});
+  const _RiveNativeWebView(
+    this.renderTexture,
+    this.painter,
+    this.resolution, {
+    super.key,
+  });
 
   @override
   RenderObject createRenderObject(BuildContext context) {
@@ -1832,20 +2403,24 @@ class _RiveNativeWebViewRenderObject extends RiveNativeRenderBox {
     if (texture is! _WebRenderTexture) {
       return false;
     }
-    final (fixedWidth, fixedHeight, scaleX, scaleY) =
-        switch (renderResolution) {
+    final (
+      fixedWidth,
+      fixedHeight,
+      scaleX,
+      scaleY,
+    ) = switch (renderResolution) {
       FixedRenderResolution(:final width, :final height) => (
           width,
           height,
           1.0,
-          1.0
+          1.0,
         ),
       LayoutRenderResolution(:final scale) => (0, 0, scale, scale),
       DisplayRenderResolution() => (
           0,
           0,
           desiredTransformWidthScale,
-          desiredTransformHeightScale
+          desiredTransformHeightScale,
         ),
     };
     return texture.setBackingPolicy(

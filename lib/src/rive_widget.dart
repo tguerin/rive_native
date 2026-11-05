@@ -6,8 +6,10 @@ import 'package:flutter/scheduler.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter/widgets.dart' hide Animation;
 import 'package:meta/meta.dart';
+import 'package:rive_native/rive_deferred.dart' as rive_deferred;
 import 'package:rive_native/rive_native.dart';
 import 'package:rive_native/semantics.dart';
+import 'package:rive_native/src/deferred_pacing_diagnostics.dart';
 import 'package:rive_native/src/rive.dart' show RiveProfiler;
 
 abstract base class ProceduralPainter extends RivePainter {
@@ -17,9 +19,6 @@ abstract base class ProceduralPainter extends RivePainter {
   /// Called each frame to paint the artboard.
   void paint(Renderer renderer, Size size, double paintPixelRatio);
 
-  /// Called before the main RenderContext frame opens to run scripted canvas
-  /// draws in their own frame. Override in subclasses that manage an artboard.
-  void prepassCanvases() {}
 
   /// Request a repaint of the artboard.
   void scheduleRepaint() => notifyListeners();
@@ -29,6 +28,20 @@ abstract base class ArtboardPainter extends ProceduralPainter {
   /// Called when the underlying artboard changes.
   void artboardChanged(Artboard artboard);
 }
+
+/// Whether [painter]'s artboard changed since it was last drawn. Painters
+/// without an artboard always report a change.
+bool _artboardDidChange(RivePainter? painter) {
+  if (painter is! RiveArtboardLayoutMixin) {
+    return true;
+  }
+  return painter.artboard?.didChange ?? true;
+}
+
+/// Whether [painter] has an artboard that changed since it was last drawn,
+/// read before a draw to tell whether the draw consumes a change.
+bool _consumesArtboardChange(RivePainter? painter) =>
+    painter is RiveArtboardLayoutMixin && (painter.artboard?.didChange ?? false);
 
 base class BasicArtboardPainter extends ArtboardPainter
     with RiveTickerAwarePainterMixin, RiveArtboardLayoutMixin {
@@ -56,11 +69,6 @@ base class BasicArtboardPainter extends ArtboardPainter
   bool advance(double elapsedSeconds) {
     bool advanced = _artboard?.advance(elapsedSeconds) ?? false;
     return advanced || (_artboard?.updatePass() ?? false);
-  }
-
-  @override
-  void prepassCanvases() {
-    _artboard?.drawCanvases();
   }
 
   @mustCallSuper
@@ -101,9 +109,10 @@ base class SingleAnimationPainter extends BasicArtboardPainter {
 }
 
 base class StateMachinePainter extends BasicArtboardPainter
-    with RivePointerEventMixin, RiveSemanticsMixin {
+    with RivePointerEventMixin, RiveSemanticsMixin, RiveKeyboardFocusMixin {
   final String? stateMachineName;
   StateMachine? _stateMachine;
+  @override
   StateMachine? get stateMachine => _stateMachine;
   CallbackHandler? _inputCallbackHandler;
 
@@ -131,6 +140,7 @@ base class StateMachinePainter extends BasicArtboardPainter
     final machine = _stateMachine = stateMachineName != null
         ? artboard.stateMachine(stateMachineName!)
         : artboard.defaultStateMachine();
+    resetSemanticTree();
     if (machine != null) {
       if (isSemanticsEnabled) {
         machine.enableSemantics();
@@ -178,8 +188,65 @@ base class StateMachinePainter extends BasicArtboardPainter
       scaleFactor: layoutScaleFactor,
     );
 
+    if (RivePointerEventMixin.isScrollEvent(event)) {
+      _scrollEvent(stateMachine, artboard, event, position);
+      return;
+    }
+
     dispatchPointerEvent(stateMachine, event, position);
   }
+
+  void _scrollEvent(
+    StateMachine stateMachine,
+    Artboard artboard,
+    PointerEvent event,
+    Vec2D position,
+  ) {
+    Offset local;
+    if (event is PointerScrollEvent) {
+      // A wheel reports how far to scroll, not how far content travels.
+      local = -event.scrollDelta;
+    } else if (event is PointerPanZoomUpdateEvent) {
+      // A trackpad's pan already follows the fingers.
+      local = event.panDelta;
+    } else {
+      local = Offset.zero;
+    }
+    final delta = localDeltaToArtboard(
+      delta: local,
+      artboardBounds: artboard.bounds,
+      fit: fit,
+      alignment: alignment,
+      size: size,
+      scaleFactor: layoutScaleFactor,
+    );
+
+    void dispatch() {
+      final result =
+          dispatchScrollEvent(stateMachine, event, position, delta);
+      if (result == HitResult.none) {
+        return;
+      }
+      // A static scroll layout may not be ticking, and without a frame the
+      // idle timer that ends the gesture never runs.
+      scheduleRepaint();
+      stateMachine.advanceAndApply(0);
+    }
+
+    if (event is! PointerSignalEvent) {
+      // Pan/zoom events are routed by hit test and are ours already.
+      dispatch();
+      return;
+    }
+    // Claim the signal only when a scroll view is under the cursor, so an
+    // enclosing Scrollable keeps the wheel otherwise.
+    if (!stateMachine.hasScrollTargetAt(position)) {
+      return;
+    }
+    GestureBinding.instance.pointerSignalResolver
+        .register(event, (_) => dispatch());
+  }
+
 
   @override
   bool advance(double elapsedSeconds) {
@@ -204,10 +271,14 @@ class RiveFileWidget extends StatefulWidget {
   final ArtboardPainter painter;
   final String? artboardName;
 
+  /// When the artboard is redrawn. See [DrawOptimization].
+  final DrawOptimization drawOptimization;
+
   const RiveFileWidget({
     required this.file,
     required this.painter,
     this.artboardName,
+    this.drawOptimization = DrawOptimization.drawWhenChanged,
     super.key,
   });
 
@@ -240,6 +311,9 @@ class _RiveFileWidgetState extends State<RiveFileWidget> {
   @override
   void didUpdateWidget(covariant RiveFileWidget oldWidget) {
     super.didUpdateWidget(oldWidget);
+    // riveFactory is immutable for this State's lifetime: the render texture
+    // and its deferred attachment are chosen once in initState. Swap the
+    // widget key to change factories.
     if (oldWidget.file != widget.file ||
         oldWidget.artboardName != widget.artboardName ||
         oldWidget.painter != widget.painter) {
@@ -261,6 +335,7 @@ class _RiveFileWidgetState extends State<RiveFileWidget> {
     return RiveArtboardWidget(
       artboard: artboard,
       painter: widget.painter,
+      drawOptimization: widget.drawOptimization,
     );
   }
 }
@@ -273,10 +348,14 @@ class RiveArtboardWidget extends StatefulWidget {
   /// Ignored with `Factory.flutter` (content paints at composite resolution).
   final RenderResolution renderResolution;
 
+  /// When the artboard is redrawn. See [DrawOptimization].
+  final DrawOptimization drawOptimization;
+
   const RiveArtboardWidget({
     required this.artboard,
     required this.painter,
     this.renderResolution = RenderResolution.defaultValue,
+    this.drawOptimization = DrawOptimization.drawWhenChanged,
     super.key,
   });
 
@@ -302,11 +381,15 @@ class _RiveArtboardWidgetState extends State<RiveArtboardWidget> {
   @override
   Widget build(BuildContext context) {
     if (widget.artboard.riveFactory == Factory.flutter) {
-      return FlutterRiveRendererWidget(painter: widget.painter);
+      return FlutterRiveRendererWidget(
+        painter: widget.painter,
+        drawOptimization: widget.drawOptimization,
+      );
     }
     return ArtboardWidgetRiveRenderer(
       painter: widget.painter,
       renderResolution: widget.renderResolution,
+      drawOptimization: widget.drawOptimization,
     );
   }
 }
@@ -324,17 +407,25 @@ class _RiveArtboardWidgetState extends State<RiveArtboardWidget> {
 ///   child: RiveArtboardWidget(artboard: artboard, painter: painter),
 /// )
 /// ```
-@experimental
 @internal
 class RiveSemanticsWidget extends StatefulWidget {
   final Artboard artboard;
   final ArtboardPainter painter;
   final Widget child;
 
+  /// When true, semantics tracking starts only once the platform requests
+  /// accessibility ([SemanticsBinding.semanticsEnabled], e.g. a screen
+  /// reader connects); until then the widget adds no overhead. Activation
+  /// is one-way: once the painter's semantics are on, they stay on for
+  /// the painter's lifetime. When false (the default), tracking starts
+  /// at mount.
+  final bool activateOnPlatformRequest;
+
   const RiveSemanticsWidget({
     required this.artboard,
     required this.painter,
     required this.child,
+    this.activateOnPlatformRequest = false,
     super.key,
   });
 
@@ -343,13 +434,25 @@ class RiveSemanticsWidget extends StatefulWidget {
 }
 
 class _RiveSemanticsWidgetState extends State<RiveSemanticsWidget> {
+  bool _waitingForPlatform = false;
+
   @override
   void initState() {
     super.initState();
-    final sem = _semanticsMixin;
-    if (sem != null) {
-      _enableSemantics(sem, widget.painter);
-    }
+    _debugCheckPainter();
+    _initSemantics();
+  }
+
+  // A painter without the mixin cannot produce semantics; silently
+  // rendering nothing hides authoring or wiring mistakes.
+  void _debugCheckPainter() {
+    assert(
+      widget.painter is RiveSemanticsMixin,
+      'RiveSemanticsWidget requires a painter that mixes in '
+      'RiveSemanticsMixin (e.g. StateMachinePainter or '
+      'RiveWidgetController); '
+      '${widget.painter.runtimeType} produces no semantics.',
+    );
   }
 
   RiveSemanticsMixin? get _semanticsMixin {
@@ -357,75 +460,201 @@ class _RiveSemanticsWidgetState extends State<RiveSemanticsWidget> {
     return painter is RiveSemanticsMixin ? painter as RiveSemanticsMixin : null;
   }
 
+  void _initSemantics() {
+    final sem = _semanticsMixin;
+    if (sem == null) return;
+    if (widget.activateOnPlatformRequest &&
+        !sem.isSemanticsEnabled &&
+        !SemanticsBinding.instance.semanticsEnabled) {
+      _waitingForPlatform = true;
+      SemanticsBinding.instance
+          .addSemanticsEnabledListener(_onPlatformSemanticsChanged);
+      return;
+    }
+    _enableSemantics(sem, widget.painter);
+  }
+
+  void _onPlatformSemanticsChanged() {
+    // Activation is one-way; ignore the platform turning semantics off.
+    if (!SemanticsBinding.instance.semanticsEnabled) return;
+    _stopWaitingForPlatform();
+    final sem = _semanticsMixin;
+    if (sem != null) {
+      _enableSemantics(sem, widget.painter);
+    }
+    // Rebuild (phase-guarded) so the overlay appears.
+    _onSemanticUpdate();
+  }
+
+  void _stopWaitingForPlatform() {
+    if (!_waitingForPlatform) return;
+    SemanticsBinding.instance
+        .removeSemanticsEnabledListener(_onPlatformSemanticsChanged);
+    _waitingForPlatform = false;
+  }
+
+  // Clears Rive semantic focus on [sm] when a tracked node holds it, and
+  // forgets the tracker. Used when the focused node's machine leaves this
+  // widget's management (dispose, painter/artboard replacement). No
+  // repaint is scheduled - teardown paths must not notify listeners.
+  void _clearTrackedFocus(StateMachine? sm) {
+    if (_a11yFocusedNodeId == null) return;
+    _a11yFocusedNodeId = null;
+    if (sm == null) return;
+    sm.focusManager?.clearFocus();
+    sm.advanceAndApply(0);
+  }
+
+  // The painter owns the semantics lifecycle: once enabled, semantics
+  // stay enabled until the painter itself is disposed. The native
+  // manager cannot replay its tree on demand (diffs are incremental
+  // against its own snapshot), so disposing the Dart tree on unmount
+  // would leave a remount with a kept state machine permanently empty.
+  // Artboard swaps reset the tree via
+  // RiveSemanticsMixin.resetSemanticTree instead.
+  //
+  // Tree changes never rebuild this widget: the overlay's render box
+  // listens to the tree itself and reads the artboard bounds live
+  // during the semantics build.
   void _enableSemantics(RiveSemanticsMixin sem, ArtboardPainter painter) {
     sem.semanticsEnabled = true;
     // Prime one zero-delta advance so world transforms/text layout are
     // valid before the first semantics snapshot.
     painter.advance(0);
-    sem.semanticTree?.addListener(_onSemanticUpdate);
   }
 
-  // Disabling disposes the SemanticTreeModel on the mixin (see
-  // RiveSemanticsMixin.semanticsEnabled setter), so a later re-enable
-  // always starts from an empty tree — no risk of applying a fresh diff
-  // stream onto nodes from a different artboard.
-  void _disableSemantics(RiveSemanticsMixin sem) {
-    sem.semanticTree?.removeListener(_onSemanticUpdate);
-    sem.semanticsEnabled = false;
-  }
-
+  // Rebuild after semantics activation so the overlay appears (per-tree
+  // updates flow through the render box, not widget rebuilds). May be
+  // called from phases where setState is illegal - defer those to the
+  // end of the frame.
   void _onSemanticUpdate() {
-    setState(() {});
+    if (!mounted) return;
+    final phase = SchedulerBinding.instance.schedulerPhase;
+    if (phase == SchedulerPhase.idle ||
+        phase == SchedulerPhase.transientCallbacks) {
+      setState(() {});
+    } else {
+      SchedulerBinding.instance.addPostFrameCallback((_) {
+        if (mounted) setState(() {});
+      });
+    }
   }
 
   @override
   void didUpdateWidget(covariant RiveSemanticsWidget oldWidget) {
     super.didUpdateWidget(oldWidget);
-    if (oldWidget.artboard == widget.artboard &&
-        oldWidget.painter == widget.painter) {
+    final sameTarget = oldWidget.artboard == widget.artboard &&
+        oldWidget.painter == widget.painter;
+    if (sameTarget &&
+        oldWidget.activateOnPlatformRequest ==
+            widget.activateOnPlatformRequest) {
       return;
     }
-    final oldPainter = oldWidget.painter;
-    if (oldPainter is RiveSemanticsMixin) {
-      _disableSemantics(oldPainter as RiveSemanticsMixin);
+    _debugCheckPainter();
+    _stopWaitingForPlatform();
+    if (!sameTarget) {
+      // The painter or artboard (and with it the state machine) is being
+      // replaced; the tracked focused node belongs to the outgoing
+      // machine, so clear it there - mirroring dispose. A mode-only
+      // update keeps the tracker: native focus is unchanged and the
+      // node's eventual blur must still be honored.
+      final oldPainter = oldWidget.painter;
+      _clearTrackedFocus(oldPainter is RiveSemanticsMixin
+          ? (oldPainter as RiveSemanticsMixin).semanticsStateMachine
+          : null);
     }
-    final sem = _semanticsMixin;
-    if (sem != null) {
-      _enableSemantics(sem, widget.painter);
-    }
+    _initSemantics();
   }
 
   @override
   void dispose() {
-    final sem = _semanticsMixin;
-    if (sem != null) {
-      _disableSemantics(sem);
-    }
+    _stopWaitingForPlatform();
+    // Unmounting removes the accessibility nodes, so any Rive-held
+    // semantic focus is gone from the platform's perspective - but the
+    // native state (deliberately kept alive with the painter) still
+    // holds it, and the deferred blur can no longer run once unmounted.
+    // Clear synchronously; the semantic tree itself stays, and the
+    // cleared Focused state reaches it on the next drain (e.g. after a
+    // remount).
+    _clearTrackedFocus(_stateMachine);
     super.dispose();
   }
 
   StateMachine? get _stateMachine => _semanticsMixin?.semanticsStateMachine;
 
+  // Semantic events only queue on the state machine and are processed on
+  // its next advance. Match pointer input handling (see
+  // RiveWidgetController.pointerEvent): schedule a repaint so a stopped
+  // ticker restarts, and advance immediately so the event is processed
+  // even while no frames are being produced.
+  void _processSemanticEvent(StateMachine sm) {
+    widget.painter.scheduleRepaint();
+    sm.advanceAndApply(0);
+  }
+
+  // Rive focus should clear when accessibility focus leaves the WIDGET,
+  // not on every per-node blur: Rive focus is exclusive, so a
+  // Rive-to-Rive move is fully handled by the next node's gain. Flutter
+  // has no widget-level accessibility-focus event, so the widget-level
+  // blur is synthesized from the per-node ones: a blur of the tracked
+  // node that no other Rive node's gain supersedes by the end of the
+  // frame means focus left the widget. (didLose and didGain arrive as
+  // separate platform messages with no ordering guarantee; a gain a
+  // frame late degrades to clear-then-refocus, which is safe.)
+  int? _a11yFocusedNodeId;
+  int _a11yFocusGeneration = 0;
+
   void _handleSemanticFocus(int semanticNodeId) {
-    _stateMachine?.focusSemanticNode(semanticNodeId);
+    final sm = _stateMachine;
+    if (sm == null) return;
+    _a11yFocusGeneration++;
+    _a11yFocusedNodeId = semanticNodeId;
+    sm.focusSemanticNode(semanticNodeId);
+    _processSemanticEvent(sm);
+  }
+
+  void _handleSemanticBlur(int semanticNodeId) {
+    if (_a11yFocusedNodeId != semanticNodeId) return;
+    final generation = _a11yFocusGeneration;
+    SchedulerBinding.instance.addPostFrameCallback((_) {
+      if (!mounted ||
+          _a11yFocusGeneration != generation ||
+          _a11yFocusedNodeId != semanticNodeId) {
+        return; // another node took focus - not a widget-level blur
+      }
+      _a11yFocusedNodeId = null;
+      final sm = _stateMachine;
+      if (sm == null) return;
+      sm.focusManager?.clearFocus();
+      _processSemanticEvent(sm);
+    });
+    // The ticker may be stopped; make sure the frame (and with it the
+    // post-frame callback) actually happens.
+    SchedulerBinding.instance.scheduleFrame();
+  }
+
+  void _fireSemanticAction(SemanticNodeData data, SemanticActionType type) {
+    final sm = _stateMachine;
+    if (sm == null) return;
+    sm.fireSemanticAction(data.id, type);
+    _processSemanticEvent(sm);
   }
 
   void _handleSemanticTap(SemanticNodeData data) {
-    _stateMachine?.fireSemanticAction(data.id, SemanticActionType.tap);
+    _fireSemanticAction(data, SemanticActionType.tap);
   }
 
   void _handleSemanticIncrease(SemanticNodeData data) {
-    _stateMachine?.fireSemanticAction(data.id, SemanticActionType.increase);
+    _fireSemanticAction(data, SemanticActionType.increase);
   }
 
   void _handleSemanticDecrease(SemanticNodeData data) {
-    _stateMachine?.fireSemanticAction(data.id, SemanticActionType.decrease);
+    _fireSemanticAction(data, SemanticActionType.decrease);
   }
 
   @override
   Widget build(BuildContext context) {
     final tree = _semanticsMixin?.semanticTree;
-    final bounds = widget.artboard.worldBounds;
     if (tree == null) {
       return widget.child;
     }
@@ -445,12 +674,13 @@ class _RiveSemanticsWidgetState extends State<RiveSemanticsWidget> {
         Positioned.fill(
           child: RiveSemanticsOverlay(
             tree: tree,
-            artboardBounds: bounds,
+            artboardBounds: () => widget.artboard.worldBounds,
             fit: fit,
             alignment: align,
             layoutScaleFactor: scale,
             onSemanticTap: _handleSemanticTap,
             onSemanticFocus: _handleSemanticFocus,
+            onSemanticBlur: _handleSemanticBlur,
             onSemanticIncrease: _handleSemanticIncrease,
             onSemanticDecrease: _handleSemanticDecrease,
           ),
@@ -468,10 +698,14 @@ class RiveProceduralRenderingWidget extends StatefulWidget {
   /// Ignored with `Factory.flutter` (content paints at composite resolution).
   final RenderResolution renderResolution;
 
+  /// When the painter is redrawn. See [DrawOptimization].
+  final DrawOptimization drawOptimization;
+
   const RiveProceduralRenderingWidget({
     required this.riveFactory,
     required this.painter,
     this.renderResolution = RenderResolution.defaultValue,
+    this.drawOptimization = DrawOptimization.drawWhenChanged,
     super.key,
   });
 
@@ -483,15 +717,42 @@ class RiveProceduralRenderingWidget extends StatefulWidget {
 class _RiveRiveProceduralRenderingWidgetState
     extends State<RiveProceduralRenderingWidget> {
   @override
+  void initState() {
+    super.initState();
+    _enableAutoAttach();
+  }
+
+  @override
+  void didUpdateWidget(covariant RiveProceduralRenderingWidget oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.riveFactory != widget.riveFactory) {
+      _enableAutoAttach();
+    }
+  }
+
+  // A session factory handed to the widget attaches to its texture like a
+  // file-owned one.
+  void _enableAutoAttach() {
+    if (rive_deferred.deferredSessionAddress(widget.riveFactory) != 0) {
+      rive_deferred.enableDeferredAutoAttach(widget.riveFactory);
+    }
+  }
+
+  @override
   Widget build(BuildContext context) {
     if (widget.riveFactory == Factory.flutter) {
       // Render the artboard with the Flutter renderer.
-      return FlutterRiveRendererWidget(painter: widget.painter);
+      return FlutterRiveRendererWidget(
+        painter: widget.painter,
+        drawOptimization: widget.drawOptimization,
+      );
     } else {
       // Render the artboard with the Rive Renderer.
       return ArtboardWidgetRiveRenderer(
         painter: widget.painter,
+        riveFactory: widget.riveFactory,
         renderResolution: widget.renderResolution,
+        drawOptimization: widget.drawOptimization,
       );
     }
   }
@@ -500,13 +761,22 @@ class _RiveRiveProceduralRenderingWidgetState
 class ArtboardWidgetRiveRenderer extends StatefulWidget {
   final ProceduralPainter? painter;
 
+  /// The factory the painter's resources were made with, for painters
+  /// without an artboard. Artboard painters report their own.
+  final Factory? riveFactory;
+
   /// How the backing texture is sized. See [RenderResolution].
   final RenderResolution renderResolution;
+
+  /// When the painter is redrawn. See [DrawOptimization].
+  final DrawOptimization drawOptimization;
 
   const ArtboardWidgetRiveRenderer({
     super.key,
     this.painter,
+    this.riveFactory,
     this.renderResolution = RenderResolution.defaultValue,
+    this.drawOptimization = DrawOptimization.drawWhenChanged,
   });
 
   @override
@@ -525,8 +795,14 @@ base class ArtboardWidgetPainter<T extends ProceduralPainter>
   final RivePointerEventMixin? _pointerEvent;
   final RiveTickerAwarePainterMixin? _tickerAwarePainter;
   final RiveArtboardLayoutMixin? _riveArtboardLayoutMixin;
-  ArtboardWidgetPainter(this._painter)
-      : _pointerEvent = _painter is RivePointerEventMixin
+  final Factory? _explicitFactory;
+  ArtboardWidgetPainter(
+    this._painter, {
+    Factory? riveFactory,
+    DrawOptimization drawOptimization = DrawOptimization.drawWhenChanged,
+  })  : _explicitFactory = riveFactory,
+        _drawOptimization = drawOptimization,
+        _pointerEvent = _painter is RivePointerEventMixin
             ? _painter as RivePointerEventMixin
             : null,
         _tickerAwarePainter = _painter is RiveTickerAwarePainterMixin
@@ -536,37 +812,45 @@ base class ArtboardWidgetPainter<T extends ProceduralPainter>
             ? _painter as RiveArtboardLayoutMixin
             : null {
     _painter?.addListener(notifyListeners);
-    _tickerAwarePainter?.setTickerStateProvider(() => isTickerActive);
+    _tickerAwarePainter?.setTickerStateProvider(_tickerStateProvider);
   }
+
+  bool _tickerStateProvider() => isTickerActive;
 
   @override
   void dispose() {
     super.dispose();
     _painter?.removeListener(notifyListeners);
-    _tickerAwarePainter?.setTickerStateProvider(null);
+    _tickerAwarePainter?.clearTickerStateProvider(_tickerStateProvider);
   }
 
   @override
   Color get background => const Color(
       0x00000000); // TODO (GORDON): make this an override and add to canvas implementation
 
-  @override
-  void prepassCanvases() {
-    _painter?.prepassCanvases();
-  }
-
-  @override
-  bool paint(RenderTexture texture, double devicePixelRatio, Size size,
-      double elapsedSeconds) {
-    final painter = _painter;
-    if (painter == null) {
-      return false;
+  /// When the painter is redrawn. See [DrawOptimization].
+  DrawOptimization get drawOptimization => _drawOptimization;
+  DrawOptimization _drawOptimization;
+  set drawOptimization(DrawOptimization value) {
+    if (_drawOptimization == value) {
+      return;
     }
-
-    final shouldContinue = painter.advance(elapsedSeconds);
-    painter.paint(texture.renderer, size, devicePixelRatio);
-    return shouldContinue;
+    _drawOptimization = value;
+    notifyListeners();
   }
+
+  @override
+  bool advance(double elapsedSeconds) =>
+      _painter?.advance(elapsedSeconds) ?? false;
+
+  @override
+  bool get needsPaint =>
+      _drawOptimization == DrawOptimization.alwaysDraw ||
+      _artboardDidChange(_painter);
+
+  @override
+  void paint(RenderTexture texture, double devicePixelRatio, Size size) =>
+      _painter?.paint(texture.renderer, size, devicePixelRatio);
 
   @override
   MouseCursor get cursor => _pointerEvent?.cursor ?? RiveDefaults.mouseCursor;
@@ -587,16 +871,31 @@ base class ArtboardWidgetPainter<T extends ProceduralPainter>
 
   @override
   Artboard? get artboard => _riveArtboardLayoutMixin?.artboard;
+
+  @override
+  Factory? get riveFactory => artboard?.riveFactory ?? _explicitFactory;
 }
 
 class _ArtboardWidgetRiveRendererState
     extends State<ArtboardWidgetRiveRenderer> {
-  final RenderTexture renderTexture = RiveNative.instance.makeRenderTexture();
+  late final RenderTexture renderTexture;
 
   ArtboardWidgetPainter? _painter;
   @override
   void initState() {
-    _painter = ArtboardWidgetPainter(widget.painter);
+    _painter = ArtboardWidgetPainter(
+      widget.painter,
+      riveFactory: widget.riveFactory,
+      drawOptimization: widget.drawOptimization,
+    );
+    // Same predicate _ensureDeferredSession attaches on, so the texture is
+    // acquired from the pool that matches how it will be driven. On web a
+    // deferred texture reuses a canvas the replay worker already holds rather
+    // than transferring — and stranding — a new one.
+    final factory = _painter?.riveFactory;
+    renderTexture = RiveNative.instance.makeRenderTexture(
+      deferred: factory != null && rive_deferred.deferredAutoAttach(factory),
+    );
     super.initState();
   }
 
@@ -612,9 +911,17 @@ class _ArtboardWidgetRiveRendererState
   void didUpdateWidget(covariant ArtboardWidgetRiveRenderer oldWidget) {
     super.didUpdateWidget(oldWidget);
     if (oldWidget.painter != widget.painter) {
+      final oldPainter = _painter;
       setState(() {
-        _painter = ArtboardWidgetPainter(widget.painter);
+        _painter = ArtboardWidgetPainter(
+          widget.painter,
+          riveFactory: widget.riveFactory,
+          drawOptimization: widget.drawOptimization,
+        );
       });
+      oldPainter?.dispose();
+    } else {
+      _painter?.drawOptimization = widget.drawOptimization;
     }
   }
 
@@ -630,7 +937,14 @@ class _ArtboardWidgetRiveRendererState
 class FlutterRiveRendererWidget extends LeafRenderObjectWidget {
   final ProceduralPainter? painter;
 
-  const FlutterRiveRendererWidget({super.key, required this.painter});
+  /// When the painter is redrawn. See [DrawOptimization].
+  final DrawOptimization drawOptimization;
+
+  const FlutterRiveRendererWidget({
+    super.key,
+    required this.painter,
+    this.drawOptimization = DrawOptimization.drawWhenChanged,
+  });
 
   @override
   RenderObject createRenderObject(BuildContext context) {
@@ -638,6 +952,7 @@ class FlutterRiveRendererWidget extends LeafRenderObjectWidget {
 
     return FlutterRiveRenderBox()
       ..painter = painter
+      ..drawOptimization = drawOptimization
       ..tickerModeEnabled = tickerModeValue;
   }
 
@@ -648,6 +963,7 @@ class FlutterRiveRendererWidget extends LeafRenderObjectWidget {
 
     renderObject
       ..painter = painter
+      ..drawOptimization = drawOptimization
       ..tickerModeEnabled = tickerModeValue;
   }
 }
@@ -666,15 +982,33 @@ abstract class RiveRenderBox<T extends RivePainter> extends RenderBox
   T? _rivePainter;
   T? get rivePainter => _rivePainter;
 
+  /// Whether the next frame draws even when the artboard did not change. Set
+  /// when something outside the artboard changes what is shown: the painter
+  /// notifying (fit, alignment, input), a new painter, or a layout.
+  ///
+  /// Also set after a draw that consumed a change. That draw can show dirt
+  /// added after the update pass (a listener writing text) and it clears the
+  /// artboard's change flag, so the next frame draws again.
+  /// When the content settled on that frame, the ticker runs one more tick
+  /// for it. Painters without an artboard never arm it.
+  @protected
+  bool forceDraw = true;
+
+  void _onPainterChanged() {
+    forceDraw = true;
+    restartTickerIfStopped();
+  }
+
   @mustCallSuper
   set painter(T? value) {
     markNeedsLayout();
     if (_rivePainter == value) {
       return;
     }
-    _rivePainter?.removeListener(restartTickerIfStopped);
+    _rivePainter?.removeListener(_onPainterChanged);
     _rivePainter = value;
-    _rivePainter?.addListener(restartTickerIfStopped);
+    _rivePainter?.addListener(_onPainterChanged);
+    forceDraw = true;
     _rivePointerEvent = _rivePainter is RivePointerEventMixin
         ? _rivePainter as RivePointerEventMixin
         : null;
@@ -825,7 +1159,7 @@ abstract class RiveRenderBox<T extends RivePainter> extends RenderBox
   @override
   void dispose() {
     _cleanUpTickerStateCallback();
-    _rivePainter?.removeListener(restartTickerIfStopped);
+    _rivePainter?.removeListener(_onPainterChanged);
     _ticker?.dispose();
     _ticker = null;
 
@@ -999,6 +1333,7 @@ abstract class RiveRenderBox<T extends RivePainter> extends RenderBox
   @override
   void performLayout() {
     _riveArtboardResizeMixin?.updateSize(size);
+    forceDraw = true;
     restartTickerIfStopped();
     if (!sizedByParent) {
       // We can use the intrinsic size here because the intrinsic size matches
@@ -1014,23 +1349,48 @@ class FlutterRiveRenderBox extends RiveRenderBox<ProceduralPainter> {
   @override
   bool get shouldAdvance => _shouldAdvance;
 
+  /// When the painter is redrawn. See [DrawOptimization].
+  DrawOptimization get drawOptimization => _drawOptimization;
+  DrawOptimization _drawOptimization = DrawOptimization.drawWhenChanged;
+  set drawOptimization(DrawOptimization value) {
+    if (_drawOptimization == value) {
+      return;
+    }
+    _drawOptimization = value;
+    forceDraw = true;
+    restartTickerIfStopped();
+  }
+
+  // Whether the next tick runs only for the trailing draw, and whether this
+  // one does. See [forceDraw].
+  bool _trailingTickScheduled = false;
+  bool _onTrailingTick = false;
+
   @override
   @mustCallSuper
   void frameCallback(Duration duration) {
     super.frameCallback(duration);
 
+    _onTrailingTick = _trailingTickScheduled;
+    _trailingTickScheduled = false;
     _shouldAdvance = rivePainter?.advance(elapsedSeconds) ?? false;
 
     if (!_shouldAdvance) {
       stopTicker();
     }
 
-    markNeedsPaint();
+    if (forceDraw ||
+        _drawOptimization == DrawOptimization.alwaysDraw ||
+        _artboardDidChange(rivePainter)) {
+      forceDraw = false;
+      markNeedsPaint();
+    }
   }
 
   @protected
   @override
   void paint(PaintingContext context, Offset offset) {
+    final changed = _consumesArtboardChange(rivePainter);
     final Canvas canvas = context.canvas;
     canvas.save();
     canvas.translate(offset.dx, offset.dy);
@@ -1038,6 +1398,14 @@ class FlutterRiveRenderBox extends RiveRenderBox<ProceduralPainter> {
     rivePainter?.paint(renderer, size, 1.0);
     renderer.dispose();
     canvas.restore();
+    if (changed) {
+      forceDraw = true;
+      if (!isTickerActive && !_onTrailingTick) {
+        _trailingTickScheduled = true;
+        restartTickerIfStopped();
+      }
+    }
+    _onTrailingTick = false;
   }
 }
 
@@ -1083,11 +1451,110 @@ abstract class RiveNativeRenderBox extends RiveRenderBox<RenderTexturePainter> {
 
   bool _swapScheduled = false;
 
+  // Cached so the per-frame check only crosses the FFI on a change.
+  int _attachedSessionAddress = 0;
+  // Set while another live texture already shows what this box would. First
+  // claim wins so this box skips painting until the holder disposes.
+  bool _deferredAttachBlocked = false;
+  // The artboard instance this box has claimed for its texture, released
+  // when it changes so a later widget can take the instance up.
+  Artboard? _displayedArtboard;
+
+  /// Another live texture, or null when [holder] is gone or is ours.
+  RenderTexture? _otherHolder(Object? holder) =>
+      holder is RenderTexture &&
+              !identical(holder, renderTexture) &&
+              !holder.isDisposed
+          ? holder
+          : null;
+
+  void _blockDeferredAttach(String reason) {
+    if (!_deferredAttachBlocked) {
+      _deferredAttachBlocked = true;
+      debugPrint(reason);
+    }
+  }
+
+  /// Attach the painted content's recording session to the texture.
+  /// Manually managed sessions like the editor's are left alone.
+  void _ensureDeferredSession() {
+    final painter = rivePainter;
+    final factory = painter?.riveFactory;
+    // Null when the painter has no session or the session is manually
+    // managed; the texture then detaches.
+    final attach = factory != null && rive_deferred.deferredAutoAttach(factory)
+        ? factory
+        : null;
+    final session = rive_deferred.deferredSessionAddress(attach);
+    // What may be shown is decided per instance, so swapping the painted
+    // artboard has to re-ask even when the session is the same one.
+    final artboard = painter is RiveArtboardLayoutMixin
+        ? (painter as RiveArtboardLayoutMixin).artboard
+        : null;
+    if (session == _attachedSessionAddress &&
+        identical(artboard, _displayedArtboard)) {
+      return;
+    }
+    if (attach != null) {
+      // One artboard instance is one animation state, so two textures showing
+      // it would present that single state as two independent views. Evicting
+      // the holder would silently wedge it, so a later box stays blank and
+      // loud instead. A session serving several textures is by design.
+      if (artboard != null &&
+          _otherHolder(rive_deferred.textureDisplaying(artboard)) != null) {
+        _blockDeferredAttach(
+            'rive_native: this artboard instance is already displayed by '
+            'another RiveWidget, so this one will stay blank. Show each '
+            'widget its own artboard instance.');
+        return;
+      }
+      if (rive_deferred.deferredBoundToOneTexture(attach) &&
+          _otherHolder(rive_deferred.deferredAttachedTexture(attach)) != null) {
+        _blockDeferredAttach(
+            'rive_native: this recording session already replays into another '
+            "RiveWidget's texture and cannot serve two, so this one will stay "
+            'blank. Give each widget a file decoded for it.');
+        return;
+      }
+      rive_deferred.setDeferredAttachedTexture(attach, renderTexture);
+    }
+    _claimArtboardDisplay(artboard);
+    _deferredAttachBlocked = false;
+    _attachedSessionAddress = session;
+    renderTexture.useDeferredSession(attach);
+  }
+
+  void _claimArtboardDisplay(Artboard? artboard) {
+    if (identical(artboard, _displayedArtboard)) {
+      return;
+    }
+    _releaseArtboardDisplay();
+    if (artboard != null) {
+      _displayedArtboard = artboard;
+      rive_deferred.setTextureDisplaying(artboard, renderTexture);
+    }
+  }
+
+  void _releaseArtboardDisplay() {
+    final artboard = _displayedArtboard;
+    if (artboard == null) {
+      return;
+    }
+    _displayedArtboard = null;
+    if (identical(rive_deferred.textureDisplaying(artboard), renderTexture)) {
+      rive_deferred.setTextureDisplaying(artboard, null);
+    }
+  }
+
   void _onTextureChanged() {
     if (!attached) {
       return;
     }
-    // Paint immediately so the freshly created texture receives a draw.
+    // Texture recreation resets the attached session, re-attach first.
+    _attachedSessionAddress = 0;
+    // Paint immediately so the freshly created texture receives a draw. A
+    // pacing gate can skip it, so the draw stays forced until it happens.
+    forceDraw = true;
     paintTexture(0, forceShouldAdvance: true);
 
     // First texture: there's no previous texture being shown, so swap straight
@@ -1131,16 +1598,22 @@ abstract class RiveNativeRenderBox extends RiveRenderBox<RenderTexturePainter> {
     if (_renderTexture == value) {
       return;
     }
+    // Give the instance up before the old texture stops being ours, then
+    // re-claim it for the new one on the next attach.
+    _releaseArtboardDisplay();
     _renderTexture.removeTextureChangedListener(_onTextureChanged);
     _renderTexture = value;
     _renderTexture.addTextureChangedListener(_onTextureChanged);
+    _attachedSessionAddress = 0; // new texture, session must re-attach
     textureIdToUse = value.textureId;
+    forceDraw = true;
     markNeedsPaint();
   }
 
   @override
   void dispose() {
     textureIdToUse = -1;
+    _releaseArtboardDisplay();
     _renderTexture.removeTextureChangedListener(_onTextureChanged);
     super.dispose();
   }
@@ -1150,10 +1623,24 @@ abstract class RiveNativeRenderBox extends RiveRenderBox<RenderTexturePainter> {
     size = constraints.biggest;
   }
 
+  // Elapsed time from ticks the pacing gates skipped, handed to the next
+  // advance so gating changes cadence, never animation speed (the shared-panel
+  // pass banks the same way).
+  double _bankedElapsedSeconds = 0;
+
   @override
   void frameCallback(Duration duration) {
     super.frameCallback(duration);
+    RiveDeferredPacingDiagnostics.instance.tick(this, elapsedSeconds);
     paintTexture(elapsedSeconds);
+  }
+
+  @override
+  void stopTicker() {
+    super.stopTicker();
+    // A stopped loop voids any pending banked time, it would otherwise leak
+    // into an unrelated later restart.
+    _bankedElapsedSeconds = 0;
   }
 
   void paintTexture(double elapsedSeconds, {bool forceShouldAdvance = false}) {
@@ -1162,11 +1649,47 @@ abstract class RiveNativeRenderBox extends RiveRenderBox<RenderTexturePainter> {
       return;
     }
 
-    // Canvas pre-pass: run scripted canvas draws before the main
-    // RenderContext frame opens (clear/flush), so they get their own frame.
-    painter.prepassCanvases();
+    // While paused record nothing, the stream has no drain. Paused time is
+    // dropped, not banked: a pause can span seconds (iOS backgrounding), and
+    // banking it would fast-forward the animation by the whole span on
+    // resume instead of freezing it.
+    if (renderTexture.deferredPaused) {
+      RiveDeferredPacingDiagnostics.instance.skipPaused();
+      return;
+    }
+
+    _ensureDeferredSession();
+
+    // Keep polling so this box attaches when the holder disposes.
+    if (_deferredAttachBlocked) {
+      RiveDeferredPacingDiagnostics.instance.skipAttachBlocked();
+      restartTickerIfStopped();
+      return;
+    }
+
+    // Skip the whole frame before anything records. The stream is stateful,
+    // so pacing must never drop an already recorded frame.
+    if (!renderTexture.canAcceptDeferredFrame) {
+      RiveDeferredPacingDiagnostics.instance.skipCanAccept();
+      _bankedElapsedSeconds += elapsedSeconds;
+      restartTickerIfStopped();
+      return;
+    }
+
+    elapsedSeconds += _bankedElapsedSeconds;
+    _bankedElapsedSeconds = 0;
+    // Advance before clearing so the draw decision sees this frame's
+    // changes. A skipped draw leaves the texture showing its last frame.
+    final shouldAdvance = painter.advance(elapsedSeconds);
+    if (!forceShouldAdvance && !forceDraw && !painter.needsPaint) {
+      _onTrailingTick = false;
+      _continueTicker(shouldAdvance);
+      return;
+    }
 
     if (!renderTexture.clear(painter.background, painter.clear)) {
+      // The advance already spent the time, so nothing is banked.
+      RiveDeferredPacingDiagnostics.instance.clearFail();
       markNeedsPaint();
       return;
     }
@@ -1177,23 +1700,24 @@ abstract class RiveNativeRenderBox extends RiveRenderBox<RenderTexturePainter> {
       fallbackX: scaleWidth,
       fallbackY: scaleHeight,
     );
+    final changed = _consumesArtboardChange(painter);
+    forceDraw = false;
     final renderer = renderTexture.renderer;
     renderer.save();
     renderer.transform(Mat2D.fromScale(sx, sy));
-    final shouldAdvance = painter.paint(
-      renderTexture,
-      devicePixelRatio,
-      size,
-      elapsedSeconds,
-    );
+    painter.paint(renderTexture, devicePixelRatio, size);
     renderer.restore();
-    _shouldAdvance = forceShouldAdvance == true || shouldAdvance;
-    if (_shouldAdvance) {
-      restartTickerIfStopped();
-    } else {
-      stopTicker();
+    if (changed) {
+      forceDraw = true;
     }
+    RiveDeferredPacingDiagnostics.instance.paint(elapsedSeconds);
+    final keepAdvancing = forceShouldAdvance || shouldAdvance;
+    // One more tick for the trailing draw. See [forceDraw].
+    final trailing = changed && !keepAdvancing && !_onTrailingTick;
+    _onTrailingTick = trailing;
+    _continueTicker(keepAdvancing || trailing);
     if (!renderTexture.flush(devicePixelRatio)) {
+      RiveDeferredPacingDiagnostics.instance.flushFail();
       markNeedsPaint();
       return;
     }
@@ -1201,6 +1725,18 @@ abstract class RiveNativeRenderBox extends RiveRenderBox<RenderTexturePainter> {
     RiveProfiler.instance.endFrame();
     if (painter.paintsCanvas) {
       markNeedsPaint();
+    }
+  }
+
+  // Whether the next tick runs only for the trailing draw.
+  bool _onTrailingTick = false;
+
+  void _continueTicker(bool shouldAdvance) {
+    _shouldAdvance = shouldAdvance;
+    if (_shouldAdvance) {
+      restartTickerIfStopped();
+    } else {
+      stopTicker();
     }
   }
 

@@ -12,133 +12,140 @@ namespace rive::gpu
 {
 class PipelineManagerVulkan : public AsyncPipelineManager<DrawPipelineVulkan>
 {
-    using Super = AsyncPipelineManager<DrawPipelineVulkan>;
+  using Super = AsyncPipelineManager<DrawPipelineVulkan>;
 
 public:
-    PipelineManagerVulkan(rcp<VulkanContext>,
-                          ShaderCompilationMode,
-                          VkImageView nullTextureView);
-    ~PipelineManagerVulkan();
+  // Returns null if the driver fails to create our objects.
+  static std::unique_ptr<PipelineManagerVulkan> make(
+      rcp<VulkanContext>,
+      ShaderCompilationMode,
+      VkImageView nullTextureView);
 
-    RenderPassVulkan& getRenderPassSynchronous(InterlockMode,
-                                               RenderPassOptionsVulkan,
-                                               VkFormat,
-                                               LoadAction);
+  ~PipelineManagerVulkan();
 
-    DrawPipelineLayoutVulkan& getDrawPipelineLayoutSynchronous(
-        InterlockMode,
-        RenderPassOptionsVulkan);
+  RenderPassVulkan& getRenderPassSynchronous(
+      InterlockMode,
+      RenderPassOptionsVulkan,
+      VkFormat,
+      LoadAction);
 
-    uint32_t vendorID() const
+  DrawPipelineLayoutVulkan& getDrawPipelineLayoutSynchronous(
+      InterlockMode,
+      RenderPassOptionsVulkan);
+
+  uint32_t vendorID() const { return m_vk->physicalDeviceProperties.vendorID; }
+
+  VkFormat featherAtlasFormat() const { return m_featherAtlasFormat; }
+
+  VulkanContext* vulkanContext() const { return m_vk.get(); }
+  VkDescriptorSetLayout perFlushDescriptorSetLayout() const
+  {
+    return m_perFlushDescriptorSetLayout;
+  }
+  VkDescriptorSetLayout perDrawDescriptorSetLayout() const
+  {
+    return m_perDrawDescriptorSetLayout;
+  }
+  VkDescriptorSetLayout emptyDescriptorSetLayout() const
+  {
+    return m_emptyDescriptorSetLayout;
+  }
+
+  VkSampler imageSampler(uint32_t i) const { return m_imageSamplers[i]; }
+
+  VkDescriptorSet nullImageDescriptorSet() const
+  {
+    return m_nullImageDescriptorSet;
+  }
+
+  enum class PLSBackingType : bool
+  {
+    inputAttachment,
+    storageTexture,
+  };
+
+  PLSBackingType plsBackingType(gpu::InterlockMode interlockMode)
+  {
+    if (interlockMode == gpu::InterlockMode::clockwise)
     {
-        return m_vk->physicalDeviceProperties().vendorID;
+      assert(m_vk->features.fragmentShaderPixelInterlock);
+      return PLSBackingType::storageTexture;
     }
+    return PLSBackingType::inputAttachment;
+  }
 
-    VkFormat featherAtlasFormat() const { return m_featherAtlasFormat; }
-
-    VulkanContext* vulkanContext() const { return m_vk.get(); }
-    VkDescriptorSetLayout perFlushDescriptorSetLayout() const
-    {
-        return m_perFlushDescriptorSetLayout;
-    }
-    VkDescriptorSetLayout perDrawDescriptorSetLayout() const
-    {
-        return m_perDrawDescriptorSetLayout;
-    }
-    VkDescriptorSetLayout emptyDescriptorSetLayout() const
-    {
-        return m_emptyDescriptorSetLayout;
-    }
-
-    VkSampler linearSampler() const { return m_linearSampler; }
-    VkSampler imageSampler(uint32_t i) const { return m_imageSamplers[i]; }
-
-    VkDescriptorSet nullImageDescriptorSet() const
-    {
-        return m_nullImageDescriptorSet;
-    }
-
-    enum class PLSBackingType : bool
-    {
-        inputAttachment,
-        storageTexture,
-    };
-
-    PLSBackingType plsBackingType(gpu::InterlockMode interlockMode)
-    {
-        if (interlockMode == gpu::InterlockMode::clockwise)
-        {
-            assert(m_vk->features.fragmentShaderPixelInterlock);
-            return PLSBackingType::storageTexture;
-        }
-        return PLSBackingType::inputAttachment;
-    }
-
-    void forEachUbershaderPermutation(
-        InterlockMode,
-        VkFormat renderTargetFormat,
-        VkImageUsageFlags renderTargetUsage,
-        LoadAction,
-        const PlatformFeatures&,
-        const std::function<bool(const PipelineProps&)>& props);
+  void forEachUbershaderPermutation(
+      InterlockMode,
+      VkFormat renderTargetFormat,
+      VkImageUsageFlags renderTargetUsage,
+      LoadAction,
+      DrawPipelineVulkan::Options drawPipelineOptions,
+      const PlatformFeatures&,
+      const std::function<bool(const PipelineProps&)>& func);
 
 #if !defined(NDEBUG)
-    virtual bool isValidUbershaderPipelineProps(
-        const PipelineProps& props,
-        const PlatformFeatures& platformFeatures) override;
+  virtual bool isValidUbershaderPipelineProps(
+      const PipelineProps& props,
+      const PlatformFeatures& platformFeatures) override;
 #endif
 
-    void queueUbershaderPipelineCreation(InterlockMode,
-                                         VkFormat renderTargetFormat,
-                                         VkImageUsageFlags renderTargetUsage,
-                                         LoadAction,
-                                         const PlatformFeatures&);
+  void queueUbershaderPipelineCreation(
+      InterlockMode,
+      VkFormat renderTargetFormat,
+      VkImageUsageFlags renderTargetUsage,
+      LoadAction,
+      const PlatformFeatures&);
 
 private:
-    virtual std::unique_ptr<DrawShaderVulkan> createVertexShader(
-        DrawType drawType,
-        ShaderFeatures shaderFeatures,
-        InterlockMode interlockMode) override;
+  PipelineManagerVulkan(rcp<VulkanContext>, ShaderCompilationMode);
 
-    virtual std::unique_ptr<DrawShaderVulkan> createFragmentShader(
-        DrawType drawType,
-        ShaderFeatures shaderFeatures,
-        InterlockMode interlockMode,
-        ShaderMiscFlags miscFlags) override;
+  bool init(VkImageView nullTextureView);
 
-    virtual std::unique_ptr<DrawPipelineVulkan> createPipeline(
-        PipelineCreateType createType,
-        uint64_t key,
-        const PipelineProps& props,
-        const PlatformFeatures&) override;
+  virtual std::unique_ptr<DrawShaderVulkan> createVertexShader(
+      DrawType drawType,
+      ShaderFeatures shaderFeatures,
+      InterlockMode interlockMode) override;
 
-    virtual PipelineStatus getPipelineStatus(
-        const DrawPipelineVulkan&) const override;
+  virtual std::unique_ptr<DrawShaderVulkan> createFragmentShader(
+      DrawType drawType,
+      ShaderFeatures shaderFeatures,
+      InterlockMode interlockMode,
+      ShaderMiscFlags miscFlags) override;
 
-    virtual void clearCacheInternal() override;
+  virtual std::unique_ptr<DrawPipelineVulkan> createPipeline(
+      PipelineCreateType createType,
+      uint64_t key,
+      const PipelineProps& props,
+      const PlatformFeatures&) override;
 
-    std::unordered_map<uint32_t, std::unique_ptr<DrawPipelineLayoutVulkan>>
-        m_drawPipelineLayouts;
+  virtual PipelineStatus getPipelineStatus(
+      const DrawPipelineVulkan&) const override;
 
-    std::unordered_map<uint32_t, std::unique_ptr<RenderPassVulkan>>
-        m_renderPasses;
+  virtual void clearCacheInternal() override;
 
-    rcp<VulkanContext> m_vk;
-    VkFormat m_featherAtlasFormat;
+  std::unordered_map<uint32_t, std::unique_ptr<DrawPipelineLayoutVulkan>>
+      m_drawPipelineLayouts;
 
-    // Samplers.
-    VkSampler m_linearSampler;
-    VkSampler m_imageSamplers[ImageSampler::MAX_SAMPLER_PERMUTATIONS];
+  std::unordered_map<uint32_t, std::unique_ptr<RenderPassVulkan>>
+      m_renderPasses;
 
-    // With the exception of PLS texture bindings, which differ by interlock
-    // mode, all other shaders use the same shared descriptor set layouts.
-    VkDescriptorSetLayout m_perFlushDescriptorSetLayout;
-    VkDescriptorSetLayout m_perDrawDescriptorSetLayout;
-    VkDescriptorSetLayout m_emptyDescriptorSetLayout; // For when a set isn't
-                                                      // used by a shader.
-    VkDescriptorPool m_staticDescriptorPool; // For descriptorSets that never
-                                             // change between frames.
-    VkDescriptorSet m_nullImageDescriptorSet;
+  rcp<VulkanContext> m_vk;
+  VkFormat m_featherAtlasFormat;
+
+  // Samplers.
+  VkSampler m_imageSamplers[ImageSampler::MAX_SAMPLER_PERMUTATIONS] = {};
+
+  // With the exception of PLS texture bindings, which differ by interlock
+  // mode, all other shaders use the same shared descriptor set layouts.
+  VkDescriptorSetLayout m_perFlushDescriptorSetLayout = VK_NULL_HANDLE;
+  VkDescriptorSetLayout m_perDrawDescriptorSetLayout = VK_NULL_HANDLE;
+  VkDescriptorSetLayout
+      m_emptyDescriptorSetLayout = VK_NULL_HANDLE; // For when a set isn't used
+                                                   // by a shader.
+  VkDescriptorPool
+      m_staticDescriptorPool = VK_NULL_HANDLE; // For descriptorSets that never
+                                               // change between frames.
+  VkDescriptorSet m_nullImageDescriptorSet = VK_NULL_HANDLE;
 };
 
 } // namespace rive::gpu

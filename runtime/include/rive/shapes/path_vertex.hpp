@@ -9,8 +9,14 @@ class PathVertex : public PathVertexBase
 {
 
 public:
-    StatusCode onAddedDirty(CoreContext* context) override;
-    void markGeometryDirty() override;
+  StatusCode onAddedDirty(CoreContext* context) override;
+  void markGeometryDirty() override;
+
+#ifdef WITH_RIVE_EDITOR
+  // Body in `editor_native/native/src/editor/shapes/path_vertex_editor.cpp`.
+  void editorParentChanged(ContainerComponent* from, ContainerComponent* to)
+      override;
+#endif
 };
 } // namespace rive
 

@@ -63,30 +63,52 @@ SemanticsDiff _diff({
     );
 
 void main() {
-  group('SemanticState.effectiveChecked / effectiveMixed', () {
-    test('Mixed takes precedence when both bits are set', () {
-      final both = SemanticState.checked | SemanticState.mixed;
-      expect(SemanticState.effectiveChecked(both), isFalse);
-      expect(SemanticState.effectiveMixed(both), isTrue);
-    });
+  group('SemanticState.checkState', () {
+    // The field lives at bit 2, two bits wide.
+    int encode(int value) => value << SemanticState.checkStateOffset;
 
-    test('Checked only → effectiveChecked is true', () {
-      expect(SemanticState.effectiveChecked(SemanticState.checked), isTrue);
-      expect(SemanticState.effectiveMixed(SemanticState.checked), isFalse);
-    });
-
-    test('Mixed only → effectiveMixed is true, effectiveChecked is false', () {
-      expect(SemanticState.effectiveChecked(SemanticState.mixed), isFalse);
-      expect(SemanticState.effectiveMixed(SemanticState.mixed), isTrue);
-    });
-
-    test('Neither bit set → both effective states are false', () {
+    test('unchecked → neither effective state', () {
+      expect(SemanticState.checkState(encode(SemanticState.checkUnchecked)),
+          SemanticState.checkUnchecked);
       expect(SemanticState.effectiveChecked(0), isFalse);
       expect(SemanticState.effectiveMixed(0), isFalse);
     });
 
-    test('Unrelated bits do not affect the check', () {
-      final flags = SemanticState.mixed |
+    test('checked → effectiveChecked only', () {
+      final flags = encode(SemanticState.checkChecked);
+      expect(SemanticState.checkState(flags), SemanticState.checkChecked);
+      expect(SemanticState.effectiveChecked(flags), isTrue);
+      expect(SemanticState.effectiveMixed(flags), isFalse);
+    });
+
+    test('mixed → effectiveMixed only', () {
+      final flags = encode(SemanticState.checkMixed);
+      expect(SemanticState.checkState(flags), SemanticState.checkMixed);
+      expect(SemanticState.effectiveChecked(flags), isFalse);
+      expect(SemanticState.effectiveMixed(flags), isTrue);
+    });
+
+    test('the unassigned fourth value reads as mixed, not as an unnamed state',
+        () {
+      final flags = encode(3);
+      expect(SemanticState.checkState(flags), SemanticState.checkMixed);
+      expect(SemanticState.effectiveMixed(flags), isTrue);
+      expect(SemanticState.effectiveChecked(flags), isFalse);
+    });
+
+    test('the field is exactly two bits and does not read its neighbours', () {
+      // Selected (bit 1) sits directly below the field and Toggled (bit 4)
+      // directly above; neither may leak into the decoded value.
+      final flags = SemanticState.selected |
+          SemanticState.toggled |
+          SemanticState.focused;
+      expect(SemanticState.checkState(flags), SemanticState.checkUnchecked);
+      expect(SemanticState.effectiveChecked(flags), isFalse);
+      expect(SemanticState.effectiveMixed(flags), isFalse);
+    });
+
+    test('unrelated flags do not disturb a set field', () {
+      final flags = encode(SemanticState.checkMixed) |
           SemanticState.selected |
           SemanticState.focused;
       expect(SemanticState.effectiveMixed(flags), isTrue);
@@ -218,7 +240,7 @@ void main() {
       model.dispose();
     });
 
-    test('removed tears down the entire subtree', () {
+    test('removed evicts exactly the listed ids', () {
       final model = SemanticTreeModel();
 
       //    1
@@ -235,8 +257,9 @@ void main() {
       ]));
       expect(model.nodeCount, 5);
 
-      // Removing 2 should also evict 4 and 5.
-      model.applyDiff(_diff(removed: const [2]));
+      // Native lists every removed node individually, in tree pre-order
+      // (semantic_manager.cpp removal detection iterates previousFlat).
+      model.applyDiff(_diff(removed: const [2, 4, 5]));
 
       expect(model.nodeCount, 2);
       expect(model.nodeById(2), isNull);
@@ -244,6 +267,40 @@ void main() {
       expect(model.nodeById(5), isNull);
       expect(model.nodeById(1)?.children, [3],
           reason: '2 should be unlinked from its parent');
+
+      model.dispose();
+    });
+
+    test('a child reparented out of a removed parent survives', () {
+      final model = SemanticTreeModel();
+
+      //    1
+      //    └── 2
+      //        └── 3
+      model.applyDiff(_diff(added: [
+        _node(id: 1, parentId: -1),
+        _node(id: 2, parentId: 1, siblingIndex: 0),
+        _node(id: 3, parentId: 2, siblingIndex: 0, label: 'survivor'),
+      ]));
+      expect(model.nodeCount, 3);
+
+      // Native removes only 2; 3 survives and is reparented to 1 via moved.
+      // A single diff carries both.
+      model.applyDiff(_diff(
+        removed: const [2],
+        moved: [_node(id: 3, parentId: 1, siblingIndex: 0)],
+        childrenUpdated: const [
+          SemanticsChildrenUpdate(parentId: 1, childIds: [3]),
+        ],
+      ));
+
+      expect(model.nodeById(2), isNull);
+      expect(model.nodeById(3), isNotNull,
+          reason: 'reparented child must survive its parent\'s removal');
+      expect(model.nodeById(3)?.parentId, 1);
+      expect(model.nodeById(3)?.label, 'survivor');
+      expect(model.nodeById(1)?.children, [3]);
+      expect(model.nodeCount, 2);
 
       model.dispose();
     });

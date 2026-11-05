@@ -19,6 +19,7 @@ late js.JSFunction _scriptingWorkspaceRequestAutocomplete;
 late js.JSFunction _scriptingWorkspaceRequestAutocompleteWGSL;
 late js.JSFunction _scriptingWorkspaceRequestGetDefinition;
 late js.JSFunction _scriptingWorkspaceHighlightRow;
+late js.JSFunction _scriptingWorkspaceFormatParseData;
 late js.JSFunction _scriptingWorkspaceResponse;
 late js.JSFunction _setScriptSource;
 late js.JSFunction _removeScriptSource;
@@ -34,7 +35,13 @@ late js.JSFunction _scriptingWorkspaceFindInFiles;
 late js.JSFunction _nativeFontBytes;
 late js.JSFunction _freeNativeFont;
 late js.JSFunction _scriptingWorkspaceRequestVM;
+late js.JSFunction _scriptingWorkspaceRequestCompileWasmAs;
+late js.JSFunction _scriptingWorkspaceSetRascStdDir;
+late js.JSFunction _scriptingWorkspaceSetBundledRascStd;
+late js.JSFunction _scriptingWorkspaceSetAsBakeOptions;
+late js.JSFunction _scriptingWorkspaceRequestTranslateToAs;
 late js.JSFunction _setScriptSourceWithType;
+late js.JSFunction _setDocumentSource;
 late js.JSFunction _setScriptSourceScoped;
 late js.JSFunction _setScriptScope;
 late js.JSFunction _setLibraryImport;
@@ -53,7 +60,7 @@ class ScriptingWorkspaceResponseResultWasm
   final bool available;
   late final ByteData? data;
   ScriptingWorkspaceResponseResultWasm(js.JSObject object)
-    : available = (object['available'] as js.JSBoolean).toDart {
+      : available = (object['available'] as js.JSBoolean).toDart {
     data = available ? (object['data'] as js.JSDataView).toDart : null;
   }
 
@@ -92,6 +99,8 @@ class ScriptingWorkspaceWasm extends ScriptingWorkspace {
         module['scriptingWorkspaceRequestGetDefinition'] as js.JSFunction;
     _setScriptSourceWithType =
         module['scriptingWorkspaceSetScriptSourceWithType'] as js.JSFunction;
+    _setDocumentSource =
+        module['scriptingWorkspaceSetDocumentSource'] as js.JSFunction;
     _setScriptSourceScoped =
         module['scriptingWorkspaceSetScriptSourceScoped'] as js.JSFunction;
     _setScriptScope =
@@ -112,6 +121,8 @@ class ScriptingWorkspaceWasm extends ScriptingWorkspace {
         module['_scriptingWorkspaceBuiltinDefinition'] as js.JSFunction;
     _scriptingWorkspaceHighlightRow =
         module['scriptingWorkspaceHighlightRow'] as js.JSFunction;
+    _scriptingWorkspaceFormatParseData =
+        module['scriptingWorkspaceFormatParseData'] as js.JSFunction;
     _scriptingWorkspaceResponse =
         module['scriptingWorkspaceResponse'] as js.JSFunction;
     _setScriptSource =
@@ -138,6 +149,16 @@ class ScriptingWorkspaceWasm extends ScriptingWorkspace {
         module['_scriptingWorkspaceFindInFiles'] as js.JSFunction;
     _scriptingWorkspaceRequestVM =
         module['scriptingWorkspaceRequestVM'] as js.JSFunction;
+    _scriptingWorkspaceRequestCompileWasmAs =
+        module['scriptingWorkspaceRequestCompileWasmAs'] as js.JSFunction;
+    _scriptingWorkspaceSetRascStdDir =
+        module['scriptingWorkspaceSetRascStdDir'] as js.JSFunction;
+    _scriptingWorkspaceSetBundledRascStd =
+        module['scriptingWorkspaceSetBundledRascStd'] as js.JSFunction;
+    _scriptingWorkspaceSetAsBakeOptions =
+        module['scriptingWorkspaceSetAsBakeOptions'] as js.JSFunction;
+    _scriptingWorkspaceRequestTranslateToAs =
+        module['scriptingWorkspaceRequestTranslateToAs'] as js.JSFunction;
     _nativeFontBytes = module['nativeFontBytes'] as js.JSFunction;
     _freeNativeFont = module['_freeNativeFont'] as js.JSFunction;
     _scriptingWorkspaceSetOreContext =
@@ -152,13 +173,15 @@ class ScriptingWorkspaceWasm extends ScriptingWorkspace {
   );
   int _nativePtr = 0;
 
-  ScriptingWorkspaceWasm({bool canvasEnabled = false}) {
-    _nativePtr =
-        (_makeScriptingWorkspace.callAsFunction(
-          null,
-          workReadyCallback.toJS,
-          canvasEnabled.toJS,
-        ) as js.JSNumber).toDartInt;
+  ScriptingWorkspaceWasm(
+      {bool canvasEnabled = false, bool netEnabled = false}) {
+    _nativePtr = (_makeScriptingWorkspace.callAsFunction(
+      null,
+      workReadyCallback.toJS,
+      canvasEnabled.toJS,
+      netEnabled.toJS,
+    ) as js.JSNumber)
+        .toDartInt;
     _finalizer.attach(this, _nativePtr, detach: this);
   }
 
@@ -175,16 +198,14 @@ class ScriptingWorkspaceWasm extends ScriptingWorkspace {
     String scriptName,
     ScriptPosition position,
   ) {
-    final workId =
-        (_scriptingWorkspaceRequestAutocomplete.callAsFunction(
-                  null,
-                  _nativePtr.toJS,
-                  scriptName.toJS,
-                  position.line.toJS,
-                  position.column.toJS,
-                )
-                as js.JSNumber)
-            .toDartInt;
+    final workId = (_scriptingWorkspaceRequestAutocomplete.callAsFunction(
+      null,
+      _nativePtr.toJS,
+      scriptName.toJS,
+      position.line.toJS,
+      position.column.toJS,
+    ) as js.JSNumber)
+        .toDartInt;
 
     return registerCompleter(workId);
   }
@@ -194,16 +215,14 @@ class ScriptingWorkspaceWasm extends ScriptingWorkspace {
     String scriptName,
     ScriptPosition position,
   ) {
-    final workId =
-        (_scriptingWorkspaceRequestAutocompleteWGSL.callAsFunction(
-                  null,
-                  _nativePtr.toJS,
-                  scriptName.toJS,
-                  position.line.toJS,
-                  position.column.toJS,
-                )
-                as js.JSNumber)
-            .toDartInt;
+    final workId = (_scriptingWorkspaceRequestAutocompleteWGSL.callAsFunction(
+      null,
+      _nativePtr.toJS,
+      scriptName.toJS,
+      position.line.toJS,
+      position.column.toJS,
+    ) as js.JSNumber)
+        .toDartInt;
 
     return registerCompleter(workId);
   }
@@ -213,16 +232,14 @@ class ScriptingWorkspaceWasm extends ScriptingWorkspace {
     String scriptName,
     ScriptPosition position,
   ) {
-    final workId =
-        (_scriptingWorkspaceRequestGetDefinition.callAsFunction(
-                  null,
-                  _nativePtr.toJS,
-                  scriptName.toJS,
-                  position.line.toJS,
-                  position.column.toJS,
-                )
-                as js.JSNumber)
-            .toDartInt;
+    final workId = (_scriptingWorkspaceRequestGetDefinition.callAsFunction(
+      null,
+      _nativePtr.toJS,
+      scriptName.toJS,
+      position.line.toJS,
+      position.column.toJS,
+    ) as js.JSNumber)
+        .toDartInt;
 
     return registerCompleter(workId);
   }
@@ -232,79 +249,84 @@ class ScriptingWorkspaceWasm extends ScriptingWorkspace {
     String scriptName,
     ScriptPosition position,
   ) {
-    final workId =
-        (_scriptingWorkspaceCompleteInsertion.callAsFunction(
-                  null,
-                  _nativePtr.toJS,
-                  scriptName.toJS,
-                  position.line.toJS,
-                  position.column.toJS,
-                )
-                as js.JSNumber)
-            .toDartInt;
+    final workId = (_scriptingWorkspaceCompleteInsertion.callAsFunction(
+      null,
+      _nativePtr.toJS,
+      scriptName.toJS,
+      position.line.toJS,
+      position.column.toJS,
+    ) as js.JSNumber)
+        .toDartInt;
     return registerCompleter(workId);
   }
 
   @override
   Future<FormatResult> format(String scriptName) {
-    final workId =
-        (_scriptingWorkspaceFormat.callAsFunction(
-                  null,
-                  _nativePtr.toJS,
-                  scriptName.toJS,
-                )
-                as js.JSNumber)
-            .toDartInt;
+    final workId = (_scriptingWorkspaceFormat.callAsFunction(
+      null,
+      _nativePtr.toJS,
+      scriptName.toJS,
+    ) as js.JSNumber)
+        .toDartInt;
 
     return registerCompleter(workId);
   }
 
   @override
   Future<List<ScriptProblemResult>> fullProblemReport() {
-    final workId =
-        (_requestFullProblemReport.callAsFunction(null, _nativePtr.toJS)
-                as js.JSNumber)
-            .toDartInt;
+    final workId = (_requestFullProblemReport.callAsFunction(
+            null, _nativePtr.toJS) as js.JSNumber)
+        .toDartInt;
     return registerCompleter(workId);
   }
 
   @override
   Future<ScriptProblemResult> problemReport(String scriptName) async {
-    final workId =
-        (_requestProblemReport.callAsFunction(
-                  null,
-                  _nativePtr.toJS,
-                  scriptName.toJS,
-                )
-                as js.JSNumber)
-            .toDartInt;
+    final workId = (_requestProblemReport.callAsFunction(
+      null,
+      _nativePtr.toJS,
+      scriptName.toJS,
+    ) as js.JSNumber)
+        .toDartInt;
     return registerCompleter(workId);
   }
 
   @override
   Future<ImplementedType?> implementedType(String scriptName) async {
-    final workId =
-        (_requestImplementedType.callAsFunction(
-                  null,
-                  _nativePtr.toJS,
-                  scriptName.toJS,
-                )
-                as js.JSNumber)
-            .toDartInt;
+    final workId = (_requestImplementedType.callAsFunction(
+      null,
+      _nativePtr.toJS,
+      scriptName.toJS,
+    ) as js.JSNumber)
+        .toDartInt;
     return registerCompleter(workId);
   }
 
   @override
   Uint32List rowHighlight(String scriptName, int row) {
-    var result =
-        _scriptingWorkspaceHighlightRow.callAsFunction(
-              null,
-              _nativePtr.toJS,
-              scriptName.toJS,
-              row.toJS,
-            )
-            as js.JSUint32Array;
+    var result = _scriptingWorkspaceHighlightRow.callAsFunction(
+      null,
+      _nativePtr.toJS,
+      scriptName.toJS,
+      row.toJS,
+    ) as js.JSUint32Array;
     return result.toDart;
+  }
+
+  @override
+  Uint8List? formatParseData(String docId) {
+    // Embind value_array: [count, wasm pointer].
+    final result = _scriptingWorkspaceFormatParseData.callAsFunction(
+      null,
+      _nativePtr.toJS,
+      docId.toJS,
+    ) as js.JSArray;
+    final count = (result.toDart[0] as js.JSNumber).toDartInt;
+    final pointer = (result.toDart[1] as js.JSNumber).toDartInt;
+    if (pointer == 0) {
+      return null;
+    }
+    return Uint8List.fromList(RiveWasm.heap(pointer, count));
   }
 
   @override
@@ -313,16 +335,14 @@ class ScriptingWorkspaceWasm extends ScriptingWorkspace {
     String prefix,
     String source,
   ) async {
-    final workId =
-        (_setSystemGeneratedSource.callAsFunctionEx(
-                  null,
-                  _nativePtr.toJS,
-                  scriptName.toJS,
-                  prefix.toJS,
-                  source.toJS,
-                )
-                as js.JSNumber)
-            .toDartInt;
+    final workId = (_setSystemGeneratedSource.callAsFunctionEx(
+      null,
+      _nativePtr.toJS,
+      scriptName.toJS,
+      prefix.toJS,
+      source.toJS,
+    ) as js.JSNumber)
+        .toDartInt;
 
     return registerCompleter(workId);
   }
@@ -338,27 +358,25 @@ class ScriptingWorkspaceWasm extends ScriptingWorkspace {
   }) async {
     final workId = libraryId == 0 && libraryVersionId == 0
         ? (_setScriptSource.callAsFunctionEx(
-                    null,
-                    _nativePtr.toJS,
-                    scriptId.toJS,
-                    scriptName.toJS,
-                    source.toJS,
-                    highlight.toJS,
-                  )
-                  as js.JSNumber)
-              .toDartInt
+            null,
+            _nativePtr.toJS,
+            scriptId.toJS,
+            scriptName.toJS,
+            source.toJS,
+            highlight.toJS,
+          ) as js.JSNumber)
+            .toDartInt
         : (_setScriptSourceScoped.callAsFunctionEx(
-                    null,
-                    _nativePtr.toJS,
-                    scriptId.toJS,
-                    scriptName.toJS,
-                    source.toJS,
-                    libraryId.toJS,
-                    libraryVersionId.toJS,
-                    highlight.toJS,
-                  )
-                  as js.JSNumber)
-              .toDartInt;
+            null,
+            _nativePtr.toJS,
+            scriptId.toJS,
+            scriptName.toJS,
+            source.toJS,
+            libraryId.toJS,
+            libraryVersionId.toJS,
+            highlight.toJS,
+          ) as js.JSNumber)
+            .toDartInt;
     if (!highlight) {
       // Still register the completer so the native response gets consumed,
       // but don't await it — just return the default result immediately.
@@ -434,14 +452,12 @@ class ScriptingWorkspaceWasm extends ScriptingWorkspace {
     if (isClosing) {
       return '';
     }
-    final workId =
-        (_rewriteRequires.callAsFunctionEx(
-                  null,
-                  _nativePtr.toJS,
-                  scriptId.toJS,
-                )
-                as js.JSNumber)
-            .toDartInt;
+    final workId = (_rewriteRequires.callAsFunctionEx(
+      null,
+      _nativePtr.toJS,
+      scriptId.toJS,
+    ) as js.JSNumber)
+        .toDartInt;
     return registerCompleter(workId);
   }
 
@@ -452,18 +468,44 @@ class ScriptingWorkspaceWasm extends ScriptingWorkspace {
     String source, {
     bool highlight = false,
   }) async {
-    final workId =
-        (_setScriptSourceWithType.callAsFunctionEx(
-                  null,
-                  _nativePtr.toJS,
-                  scriptId.toJS,
-                  scriptName.toJS,
-                  source.toJS,
-                  3.toJS,
-                  highlight.toJS,
-                )
-                as js.JSNumber)
-            .toDartInt;
+    final workId = (_setScriptSourceWithType.callAsFunctionEx(
+      null,
+      _nativePtr.toJS,
+      scriptId.toJS,
+      scriptName.toJS,
+      source.toJS,
+      3.toJS,
+      highlight.toJS,
+    ) as js.JSNumber)
+        .toDartInt;
+    if (!highlight) {
+      unawaited(registerCompleter(workId));
+      return HighlightResult(HighlightResultType.unknown);
+    }
+
+    return registerCompleter(workId);
+  }
+
+  @override
+  Future<HighlightResult> setDocumentSource(
+    String scriptId,
+    String scriptName,
+    String source, {
+    required String formatScriptId,
+    required String formatExtension,
+    bool highlight = false,
+  }) async {
+    final workId = (_setDocumentSource.callAsFunctionEx(
+      null,
+      _nativePtr.toJS,
+      scriptId.toJS,
+      scriptName.toJS,
+      source.toJS,
+      formatScriptId.toJS,
+      formatExtension.toJS,
+      highlight.toJS,
+    ) as js.JSNumber)
+        .toDartInt;
     if (!highlight) {
       unawaited(registerCompleter(workId));
       return HighlightResult(HighlightResultType.unknown);
@@ -481,15 +523,13 @@ class ScriptingWorkspaceWasm extends ScriptingWorkspace {
     String scriptId,
     String source,
   ) async {
-    final workId =
-        (_setScriptDiffSource.callAsFunctionEx(
-                  null,
-                  _nativePtr.toJS,
-                  scriptId.toJS,
-                  source.toJS,
-                )
-                as js.JSNumber)
-            .toDartInt;
+    final workId = (_setScriptDiffSource.callAsFunctionEx(
+      null,
+      _nativePtr.toJS,
+      scriptId.toJS,
+      source.toJS,
+    ) as js.JSNumber)
+        .toDartInt;
     return registerCompleter(workId);
   }
 
@@ -502,15 +542,13 @@ class ScriptingWorkspaceWasm extends ScriptingWorkspace {
     if (isClosing) {
       return '';
     }
-    final workId =
-        (_requestDiffSourceLine.callAsFunctionEx(
-                  null,
-                  _nativePtr.toJS,
-                  scriptId.toJS,
-                  line.toJS,
-                )
-                as js.JSNumber)
-            .toDartInt;
+    final workId = (_requestDiffSourceLine.callAsFunctionEx(
+      null,
+      _nativePtr.toJS,
+      scriptId.toJS,
+      line.toJS,
+    ) as js.JSNumber)
+        .toDartInt;
     return registerCompleter(workId);
   }
 
@@ -522,18 +560,16 @@ class ScriptingWorkspaceWasm extends ScriptingWorkspace {
     OptimizationLevel optimizationLevel = OptimizationLevel.medium,
     DebugLevel debugLevel = DebugLevel.medium,
   }) {
-    final workId =
-        (_scriptingWorkspaceCompile.callAsFunctionEx(
-                  null,
-                  _nativePtr.toJS,
-                  scriptName.toJS,
-                  _boolWasm(failOnErrors),
-                  _boolWasm(compileDependencies),
-                  optimizationLevel.index.toJS,
-                  debugLevel.index.toJS,
-                )
-                as js.JSNumber)
-            .toDartInt;
+    final workId = (_scriptingWorkspaceCompile.callAsFunctionEx(
+      null,
+      _nativePtr.toJS,
+      scriptName.toJS,
+      _boolWasm(failOnErrors),
+      _boolWasm(compileDependencies),
+      optimizationLevel.index.toJS,
+      debugLevel.index.toJS,
+    ) as js.JSNumber)
+        .toDartInt;
     return registerCompleter(workId);
   }
 
@@ -557,27 +593,98 @@ class ScriptingWorkspaceWasm extends ScriptingWorkspace {
 
   @override
   Future<VMResult?> requestVM({int factoryPointer = 0}) {
-    final workId =
-        (_scriptingWorkspaceRequestVM.callAsFunction(
-                  null,
-                  _nativePtr.toJS,
-                  factoryPointer.toJS,
-                )
-                as js.JSNumber)
-            .toDartInt;
+    final workId = (_scriptingWorkspaceRequestVM.callAsFunction(
+      null,
+      _nativePtr.toJS,
+      factoryPointer.toJS,
+    ) as js.JSNumber)
+        .toDartInt;
+    return registerCompleter(workId);
+  }
+
+  @override
+  Future<WasmModuleResult?> requestCompileWasmAs({
+    WasmSimd simd = WasmSimd.on,
+    bool forExport = false,
+    bool debugProbes = true,
+    bool fuel = false,
+  }) {
+    final workId = (_scriptingWorkspaceRequestCompileWasmAs.callMethodVarArgs(
+      'call'.toJS,
+      [
+        null,
+        _nativePtr.toJS,
+        simd.index.toJS,
+        forExport.toJS,
+        debugProbes.toJS,
+        fuel.toJS,
+      ],
+    ) as js.JSNumber)
+        .toDartInt;
+    return registerCompleter(workId);
+  }
+
+  @override
+  void setRascStdDir(String dir) {
+    _scriptingWorkspaceSetRascStdDir.callAsFunction(
+        null, _nativePtr.toJS, dir.toJS);
+  }
+
+  @override
+  void setAsBakeOptions({WasmSimd simd = WasmSimd.on}) {
+    _scriptingWorkspaceSetAsBakeOptions.callAsFunction(
+        null, _nativePtr.toJS, simd.index.toJS);
+  }
+
+  @override
+  bool setBundledRascStd() =>
+      (_scriptingWorkspaceSetBundledRascStd.callAsFunction(
+              null, _nativePtr.toJS) as js.JSBoolean)
+          .toDart;
+
+  @override
+  Future<AsTranslation?> requestTranslateToAs(String scriptId) {
+    final workId = (_scriptingWorkspaceRequestTranslateToAs.callAsFunction(
+      null,
+      _nativePtr.toJS,
+      scriptId.toJS,
+    ) as js.JSNumber)
+        .toDartInt;
+    return registerCompleter(workId);
+  }
+
+  @override
+  Future<HighlightResult> setAnimaScriptSource(
+    String scriptId,
+    String scriptName,
+    String source, {
+    bool highlight = false,
+  }) async {
+    final workId = (_setScriptSourceWithType.callAsFunctionEx(
+      null,
+      _nativePtr.toJS,
+      scriptId.toJS,
+      scriptName.toJS,
+      source.toJS,
+      5.toJS,
+      highlight.toJS,
+    ) as js.JSNumber)
+        .toDartInt;
+    if (!highlight) {
+      unawaited(registerCompleter(workId));
+      return HighlightResult(HighlightResultType.unknown);
+    }
     return registerCompleter(workId);
   }
 
   @override
   Future<bool> checkNeedsRecompile(String scriptId) {
-    final workId =
-        (_scriptingWorkspaceCheckNeedsRecompile.callAsFunction(
-                  null,
-                  _nativePtr.toJS,
-                  scriptId.toJS,
-                )
-                as js.JSNumber)
-            .toDartInt;
+    final workId = (_scriptingWorkspaceCheckNeedsRecompile.callAsFunction(
+      null,
+      _nativePtr.toJS,
+      scriptId.toJS,
+    ) as js.JSNumber)
+        .toDartInt;
     return registerCompleter(workId);
   }
 
@@ -585,11 +692,10 @@ class ScriptingWorkspaceWasm extends ScriptingWorkspace {
   ScriptingWorkspaceResponseResult responseForWork(int workId) =>
       ScriptingWorkspaceResponseResultWasm(
         _scriptingWorkspaceResponse.callAsFunction(
-              null,
-              _nativePtr.toJS,
-              workId.toJS,
-            )
-            as js.JSObject,
+          null,
+          _nativePtr.toJS,
+          workId.toJS,
+        ) as js.JSObject,
       );
 
   @override
@@ -598,31 +704,29 @@ class ScriptingWorkspaceWasm extends ScriptingWorkspace {
 
   @override
   String get builtinDefinitions => RiveWasm.toDartString(
-    (_scriptingWorkspaceBuiltinDefinitions.callAsFunction(null, _nativePtr.toJS)
-            as js.JSNumber)
-        .toDartInt,
-  );
+        (_scriptingWorkspaceBuiltinDefinitions.callAsFunction(
+                null, _nativePtr.toJS) as js.JSNumber)
+            .toDartInt,
+      );
 
   @override
   List<String> get builtinDefinitionKeys => RiveWasm.toDartString(
-    (_scriptingWorkspaceBuiltinDefinitionKeys.callAsFunction(
-              null,
-              _nativePtr.toJS,
-            )
-            as js.JSNumber)
-        .toDartInt,
-  ).split('\n').where((s) => s.isNotEmpty).toList();
+        (_scriptingWorkspaceBuiltinDefinitionKeys.callAsFunction(
+          null,
+          _nativePtr.toJS,
+        ) as js.JSNumber)
+            .toDartInt,
+      ).split('\n').where((s) => s.isNotEmpty).toList();
 
   @override
   String builtinDefinition(String key) => RiveWasm.toDartString(
-    (_scriptingWorkspaceBuiltinDefinition.callAsFunction(
-              null,
-              _nativePtr.toJS,
-              key.toJS,
-            )
-            as js.JSNumber)
-        .toDartInt,
-  );
+        (_scriptingWorkspaceBuiltinDefinition.callAsFunction(
+          null,
+          _nativePtr.toJS,
+          key.toJS,
+        ) as js.JSNumber)
+            .toDartInt,
+      );
 
   @override
   Future<CompileAndSignResult?> compileAndSign(
@@ -655,26 +759,30 @@ class ScriptingWorkspaceWasm extends ScriptingWorkspace {
     final buffer = writer.uint8Buffer;
     final wasmBuffer = WasmBuffer.fromBytes(buffer);
 
-    final workId =
-        (_scriptingWorkspaceFindInFiles.callAsFunctionEx(
-                  null,
-                  _nativePtr.toJS,
-                  wasmBuffer.pointer,
-                  buffer.length.toJS,
-                  _boolWasm(caseSensitive),
-                  _boolWasm(matchWholeWord),
-                  _boolWasm(regularExpression),
-                  _boolWasm(trim),
-                )
-                as js.JSNumber)
-            .toDartInt;
+    final workId = (_scriptingWorkspaceFindInFiles.callAsFunctionEx(
+      null,
+      _nativePtr.toJS,
+      wasmBuffer.pointer,
+      buffer.length.toJS,
+      _boolWasm(caseSensitive),
+      _boolWasm(matchWholeWord),
+      _boolWasm(regularExpression),
+      _boolWasm(trim),
+    ) as js.JSNumber)
+        .toDartInt;
     wasmBuffer.dispose();
     return registerCompleter(workId);
   }
 }
 
-ScriptingWorkspace makeScriptingWorkspace({bool canvasEnabled = false}) =>
-    ScriptingWorkspaceWasm(canvasEnabled: canvasEnabled);
+ScriptingWorkspace makeScriptingWorkspace({
+  bool canvasEnabled = false,
+  bool netEnabled = false,
+}) =>
+    ScriptingWorkspaceWasm(
+      canvasEnabled: canvasEnabled,
+      netEnabled: netEnabled,
+    );
 
 /// On web, GPU scripting is now configured via [configureGPUFromRenderTextureImpl]
 /// which extracts context pointers directly from the RenderTexture. This legacy

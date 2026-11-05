@@ -1,6 +1,6 @@
 import 'dart:typed_data';
 
-import 'package:flutter/foundation.dart' show ChangeNotifier;
+import 'package:flutter/foundation.dart' show ChangeNotifier, visibleForTesting;
 import 'package:rive_native/rive_native.dart';
 
 import 'src/ffi/rive_luau_ffi.dart'
@@ -161,6 +161,22 @@ abstract class PointerEvent {
   HitResult get hitResult;
 }
 
+/// The ScrollEvent a script's pointerScroll receives, read back for the hit
+/// result it reported.
+abstract class ScriptScrollEvent {
+  HitResult get hitResult;
+}
+
+/// Test diagnostics implemented by the concrete [LuauState]s; kept off
+/// [LuauState] so adding to it never breaks other implementers.
+abstract interface class LuauStateDiagnostics {
+  /// Host functions from [LuauState.pushFunction] still retained; only
+  /// [LuauState.dispose] frees them, so this should stay flat across repeated
+  /// script work.
+  @visibleForTesting
+  int get retainedFunctionCount;
+}
+
 abstract class LuauState {
   void dispose();
 
@@ -186,6 +202,15 @@ abstract class LuauState {
   }) {
     return adoptLuauState(vmPointer, riveFactory, renderTexture: renderTexture);
   }
+
+  /// Reports the presenting surface's device pixels per layout point; a
+  /// change re-announces every scripted layout's size to its script.
+  void displayScale(double scale);
+
+  /// The last value given to [displayScale], 1 until one is reported. Mirrors
+  /// the native backend's own default so a layout that resizes before the
+  /// stage reports a scale still passes a number to its script.
+  double get currentDisplayScale;
 
   int integerAt(int index);
   int unsignedAt(int index);
@@ -220,16 +245,36 @@ abstract class LuauState {
   int pushViewModel(InternalDataContext dataContext);
   int pushDataContext(InternalDataContext dataContext);
 
+  int pushViewModelInstance(InternalViewModelInstance instance);
+
+  int pushGlobalViewModelNames(File file);
+
   /// Pushes a renderer onto the Lua stack.
   /// Returns null if the renderer is invalid (e.g., null pointer).
   ScriptedRenderer? pushRenderer(Renderer renderer);
   void pushArtboard(Artboard artboard, InternalDataContext? dataContext);
+
+  /// Draws [artboard]'s content into the ScriptedRenderer sitting at Lua stack
+  /// [rendererIndex], placed by [worldTransform]. Lets a ScriptedTransition
+  /// script draw a TransitionChild into whatever renderer it passes — the main
+  /// renderer or an offscreen canvas renderer — matching the runtime's
+  /// TransitionChild::draw.
+  void drawArtboardToStackRenderer(
+      int rendererIndex, Artboard artboard, Mat2D worldTransform);
+
+  /// Pushes a Luau buffer copied from [bytes].
+  void pushBuffer(Uint8List bytes);
+
+  /// Bytes of the buffer at [index] copied out, or null when the value is
+  /// not a buffer.
+  Uint8List? bufferAt(int index);
   void pushPath(RenderPath path);
   void pushViewModelInstanceValue(InternalViewModelInstanceValue value);
 
   /// Pushes a [RenderImage] onto the Lua stack as a ScriptedImage userdata.
   /// Returns 1 if successful, 0 if the image is null.
   int pushImage(RenderImage image);
+
   /// Pushes [font] onto the Lua stack as a Font userdata. Returns 1 on
   /// success, 0 when the font could not be pushed.
   int pushFont(Font font);
@@ -245,25 +290,10 @@ abstract class LuauState {
   /// `canvas:beginRenderPass(desc)` descriptor.
   int pushGPUCanvas(int width, int height);
 
-  /// Begins a GPU frame. Must be called before any GPU canvas draw calls.
-  void gpuBeginFrame();
-
-  /// Ends a GPU frame. Must be called after all GPU canvas draw calls.
-  void gpuEndFrame();
-
   /// Pushes [AudioSource] onto the Lua stack as a ScriptedAudioSource userdata.
   /// Returns 1 if successful, 0 if the image is null.
   int pushAudio(AudioSource audio);
   void pushBlob(String name, Uint8List data);
-
-  void enableDrawCanvasPhase();
-  void disableDrawCanvasPhase();
-
-  /// Advances (resets) script-created view model instances that are detached
-  /// from any bound view model tree. Call once at the end of each frame so
-  /// fired triggers are consumed/re-armed. Mirrors the runtime's
-  /// Artboard::advanceScriptedViewModels.
-  void advanceDetachedViewModels();
 
   /// Looks up a shader by name from the per-VM ScriptingContext (editor) or
   /// file assets (runtime) and pushes the ScriptedShader onto the stack.
@@ -411,7 +441,12 @@ abstract class LuauState {
   ScriptedDataValue dataValueAt(int index);
   ScriptedPath pathAt(int index);
 
-  PointerEvent pushPointerEvent(int id, Vec2D position);
+  /// [hitType] is a ListenerType index; -1 reads as "unknown" in scripts.
+  PointerEvent pushPointerEvent(int id, Vec2D position,
+      {int hitType = -1, double timeStamp = 0});
+  /// [position] and [event]'s delta are in the script's local space.
+  ScriptScrollEvent pushScrollEvent(int id, Vec2D position, ScrollEvent event,
+      {double timeStamp = 0});
   void pushPointerListenerInvocation(int id, Vec2D position,
       Vec2D previousPosition, int listenerType, double timeStamp);
   void pushKeyboardListenerInvocation(
@@ -470,8 +505,21 @@ abstract class LuauState {
   /// Default is 50ms.
   void setExecutionTimeout(int timeoutMs);
 
+  /// Tags Properties created from now on with [tag] (0 clears the tag).
+  /// Hosts set this around script callbacks they own (a FileFormat view),
+  /// so the owner's listener registrations can be released as a group.
+  void setPropertyOwnerTag(int tag);
+
+  /// Disposes every unowned Property created under [tag], clearing its
+  /// listeners immediately instead of waiting for GC or a VM swap.
+  void disposeOrphanProperties(int tag);
+
   /// Gets the current execution timeout in milliseconds.
   int getExecutionTimeout();
+
+  /// Whether the last [pcall] stopped because it ran past the execution
+  /// timeout, rather than on an error of its own.
+  bool get budgetExceeded;
 
   /// Store a generator ref in the scripting context, keyed by asset ID.
   /// This allows ScriptAsset::initScriptedObjectWith() to look up refs

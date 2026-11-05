@@ -38,11 +38,15 @@ class BinaryWriter {
   }
 
   void _ensureAvailable(int byteLength) {
-    if (_writeIndex + byteLength > _buffer.length) {
-      do {
-        _buffer = Uint8List(_buffer.length + nextAlignment(byteLength))
-          ..setRange(0, _buffer.length, _buffer);
-      } while (_writeIndex + byteLength > _buffer.length);
+    final required = _writeIndex + byteLength;
+    if (required > _buffer.length) {
+      // Grow geometrically: additive growth reallocates and copies the whole
+      // buffer per alignment stride, turning large serializes quadratic.
+      var newLength = max(_buffer.length * 2, _alignment);
+      while (newLength < required) {
+        newLength *= 2;
+      }
+      _buffer = Uint8List(newLength)..setRange(0, _writeIndex, _buffer);
       _byteData = ByteData.view(_buffer.buffer);
     }
   }

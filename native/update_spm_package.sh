@@ -57,6 +57,17 @@ update_package_swift() {
         exit 1
     fi
 
+    # A release must never ship a local binary target (spm_use_local_binary.sh
+    # is a build/test-time toggle only).
+    if grep -qE '^[[:space:]]*path: "Frameworks/RiveNative_' "$package_swift"; then
+        echo "Error: $package_swift points at a local binary target." >&2
+        echo "If this is an uncommitted local toggle, restore it with:" >&2
+        echo "  git checkout -- $package_swift" >&2
+        echo "If the local form was committed, revert that commit before" >&2
+        echo "releasing (spm_use_local_binary.sh is build/test-time only)." >&2
+        exit 1
+    fi
+
     echo "Updating $package_swift..."
     echo "  Version: $version"
     echo "  Checksum: $checksum"
